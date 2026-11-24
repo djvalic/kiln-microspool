@@ -14,6 +14,15 @@ WebSocket через tornado (ping/pong живучесть, событие delet
 AsyncHTTPClient), лимит соединений и отсутствие утечки RSS на 2000 запросах,
 встроенный веб-интерфейс (gzip / 406 / -U), /api/v1/setting/currency,
 /api/v1/material, /api/v1/location, /api/v1/lot-number.
+
+Kiln OS hardening: LAN connection pool and loopback reservation (LAN clients
+are simulated from 127.0.0.2..7), slowloris deadline, websocket ping interval
+and silence timeout, non-reading websocket client, Host/Origin/Content-Type
+checks, UI security headers and CSP, UTF-8 and number validation, data file
+id checks, .bak fallback, temp files, failed save -> 500 and rollback
+(read-only directory; skipped as root), 5 s deferred flush and SIGHUP, LAN
+write rate limit, field/external endpoints, limit/offset/vendor.id and
+websocket subscription paths.
 """
 import asyncio
 import gzip
@@ -134,10 +143,10 @@ def http_json(base, method, path, body=None, headers=None):
         return e.code, j, dict(e.headers)
 
 
-def raw_http(port, method, path, headers, body=b"", read_timeout=3.0):
+def raw_http(port, method, path, headers, body=b"", read_timeout=3.0, host="127.0.0.1"):
     """Полностью ручной HTTP-запрос — для тестов 411/413/некорректных заголовков."""
     s = socket.create_connection(("127.0.0.1", port), timeout=read_timeout)
-    lines = [f"{method} {path} HTTP/1.1", "Host: 127.0.0.1"]
+    lines = [f"{method} {path} HTTP/1.1"] + ([f"Host: {host}"] if host is not None else [])
     for k, v in headers.items():
         lines.append(f"{k}: {v}")
     lines.append("")
@@ -313,7 +322,7 @@ def test_spool_crud_and_weights(base, filament_id):
     status, lst3, _ = http_json(base, "GET", "/api/v1/spool?allow_archived=1")
     check("spool: allow_archived=1 содержит архивную", any(x["id"] == arch["id"] for x in lst3))
     status, lst4, hdrs4 = http_json(base, "GET", "/api/v1/spool?limit=1000")
-    check("spool: ?limit=1000 игнорируется, но не ломает запрос", status == 200)
+    check("spool: ?limit=1000 (HelixScreen) -> 200, all spools", status == 200 and len(lst4) == len(lst))
 
     status, deleted, _ = http_json(base, "DELETE", f"/api/v1/spool/{arch['id']}")
     check("spool: DELETE -> 200", status == 200 and deleted["id"] == arch["id"])
@@ -367,6 +376,141 @@ def test_errors_and_limits(base):
 # Встроенный веб-интерфейс, /api/v1/setting и списки material/location/lot-number
 # ---------------------------------------------------------------------------
 
+def test_api_gaps():
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        for ent in ("vendor", "filament", "spool"):
+            status, arr, _ = http_json(base, "GET", f"/api/v1/field/{ent}")
+            check(f"field: GET /api/v1/field/{ent} -> []", status == 200 and arr == [], f"{status} {arr}")
+        status, _, _ = http_json(base, "GET", "/api/v1/field/nope")
+        check("field: unknown entity -> 404", status == 404)
+        status, arr, _ = http_json(base, "POST", "/api/v1/field/filament/pressure_advance",
+                                   {"name": "Pressure advance", "field_type": "float"})
+        check("field: POST definition (HelixScreen) -> 200 with the field",
+              status == 200 and arr and arr[0]["key"] == "pressure_advance" and arr[0]["field_type"] == "float", arr)
+        status, _, _ = http_json(base, "POST", "/api/v1/field/filament/Bad-Key", {"name": "x", "field_type": "text"})
+        check("field: invalid key -> 400", status == 400)
+        status, _, _ = http_json(base, "POST", "/api/v1/field/filament/k", {"name": 1})
+        check("field: POST without name/field_type -> 400", status == 400)
+
+        status, arr, _ = http_json(base, "GET", "/api/v1/external/filament/search?query=pla&limit=20")
+        check("external: /external/filament/search -> []", status == 200 and arr == [], f"{status} {arr}")
+        status, arr, _ = http_json(base, "GET", "/api/v1/external/anything/else")
+        check("external: anything under /external/ -> []", status == 200 and arr == [])
+
+        status, info, _ = http_json(base, "GET", "/api/v1/info")
+        check("info: version stays 0.22.1 (Moonraker/Fluidd check it)", info.get("version") == "0.22.1")
+        check("info: data_dir no longer leaks the absolute path",
+              info.get("data_dir") == "microspool.json" and srv.tmpdir not in json.dumps(info), info)
+
+        status, v1, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "A"})
+        status, v2, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "B"})
+        status, v3, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "C"})
+        status, lst, h = http_json(base, "GET", "/api/v1/vendor?limit=1&offset=1")
+        check("paging: vendor limit=1&offset=1 -> second record",
+              status == 200 and [x["name"] for x in lst] == ["B"], lst)
+        check("paging: X-Total-Count is the total before paging", h.get("X-Total-Count") == "3", h)
+        status, lst, h = http_json(base, "GET", "/api/v1/vendor?offset=5")
+        check("paging: offset past the end -> [] with total", status == 200 and lst == [] and h.get("X-Total-Count") == "3")
+        status, lst, _ = http_json(base, "GET", "/api/v1/vendor?limit=0")
+        check("paging: limit=0 -> []", status == 200 and lst == [])
+        status, lst, _ = http_json(base, "GET", "/api/v1/vendor?limit=1000")
+        check("paging: limit=1000 (HelixScreen) -> all", status == 200 and len(lst) == 3)
+        for q in ("limit=-1", "limit=abc", "offset=-2", "limit="):
+            status, _, _ = http_json(base, "GET", f"/api/v1/vendor?{q}")
+            check(f"paging: {q} -> 400", status == 400)
+
+        mk = lambda vid: http_json(base, "POST", "/api/v1/filament",
+                                   dict({"density": 1.24, "diameter": 1.75, "weight": 1000}, **({"vendor_id": vid} if vid else {})))[1]
+        fa, fb, fn = mk(v1["id"]), mk(v2["id"]), mk(None)
+        status, lst, h = http_json(base, "GET", f"/api/v1/filament?vendor.id={v1['id']}")
+        check("filter: filament?vendor.id=N (HelixScreen) -> only that vendor's",
+              status == 200 and [x["id"] for x in lst] == [fa["id"]] and h.get("X-Total-Count") == "1", lst)
+        status, lst, _ = http_json(base, "GET", f"/api/v1/filament?vendor.id={v1['id']},{v2['id']}")
+        check("filter: vendor.id list", [x["id"] for x in lst] == [fa["id"], fb["id"]], lst)
+        status, lst, _ = http_json(base, "GET", "/api/v1/filament?vendor.id=-1")
+        check("filter: vendor.id=-1 -> filaments without vendor", [x["id"] for x in lst] == [fn["id"]], lst)
+
+        for _ in range(3):
+            http_json(base, "POST", "/api/v1/spool", {"filament_id": fa["id"]})
+        status, lst, h = http_json(base, "GET", "/api/v1/spool?limit=2")
+        check("paging: spool limit=2", status == 200 and len(lst) == 2 and h.get("X-Total-Count") == "3", h)
+        status, lst, _ = http_json(base, "GET", "/api/v1/filament?limit=1&offset=2")
+        check("paging: filament limit/offset", [x["id"] for x in lst] == [fn["id"]], lst)
+    finally:
+        srv.cleanup()
+
+
+async def _ws_subscriptions(base, port):
+    from tornado.websocket import websocket_connect
+    from tornado.httpclient import AsyncHTTPClient, HTTPRequest
+
+    async def sub(path):
+        conn = await websocket_connect(f"ws://127.0.0.1:{port}{path}", connect_timeout=5.0)
+        got = []
+
+        async def reader():
+            while True:
+                msg = await conn.read_message()
+                if msg is None:
+                    return
+                got.append(json.loads(msg))
+        return conn, got, asyncio.ensure_future(reader())
+
+    client = AsyncHTTPClient()
+
+    async def call(method, path, body=None):
+        r = await client.fetch(HTTPRequest(base + path, method=method,
+                                           body=json.dumps(body) if body is not None else None,
+                                           headers={"Content-Type": "application/json"}), raise_error=False)
+        return json.loads(r.body) if r.body else None
+
+    v = await call("POST", "/api/v1/vendor", {"name": "WS"})
+    f = await call("POST", "/api/v1/filament", {"vendor_id": v["id"], "density": 1.24, "diameter": 1.75, "weight": 1000})
+    s1 = await call("POST", "/api/v1/spool", {"filament_id": f["id"]})
+    s2 = await call("POST", "/api/v1/spool", {"filament_id": f["id"]})
+    subs = {p: await sub(p) for p in ("/api/v1/", "/api/v1/spool", f"/api/v1/spool/{s1['id']}", "/api/v1/filament", "/api/v1/vendor")}
+    await asyncio.sleep(0.2)
+    await call("PATCH", f"/api/v1/spool/{s1['id']}", {"comment": "one"})
+    await call("PATCH", f"/api/v1/spool/{s2['id']}", {"comment": "two" * 60})   # > 125 bytes payload
+    await call("PATCH", f"/api/v1/filament/{f['id']}", {"comment": "f"})
+    await call("PATCH", f"/api/v1/vendor/{v['id']}", {"comment": "v"})
+    f2 = await call("POST", "/api/v1/filament", {"density": 1.0, "diameter": 1.75})
+    await call("DELETE", f"/api/v1/filament/{f2['id']}")
+    await asyncio.sleep(0.5)
+    out = {}
+    for p, (conn, got, task) in subs.items():
+        out[p] = [(e["resource"], e["type"], e["payload"]["id"]) for e in got]
+        conn.close()
+        task.cancel()
+    return out, s1["id"], s2["id"], f["id"], f2["id"], v["id"]
+
+
+def test_ws_subscriptions():
+    srv = Server()
+    try:
+        srv.start()
+        ev, s1, s2, f1, f2, v1 = asyncio.run(_ws_subscriptions(srv.base_url(), srv.port))
+        check("ws sub: /api/v1/spool gets spool events only (Moonraker)",
+              ev["/api/v1/spool"] == [("spool", "updated", s1), ("spool", "updated", s2)], ev["/api/v1/spool"])
+        check("ws sub: /api/v1/spool/{id} gets that spool only",
+              ev[f"/api/v1/spool/{s1}"] == [("spool", "updated", s1)], ev[f"/api/v1/spool/{s1}"])
+        check("ws sub: /api/v1/filament gets filament events (updated, added, deleted)",
+              ev["/api/v1/filament"] == [("filament", "updated", f1), ("filament", "added", f2), ("filament", "deleted", f2)],
+              ev["/api/v1/filament"])
+        check("ws sub: /api/v1/vendor gets vendor events", ev["/api/v1/vendor"] == [("vendor", "updated", v1)], ev["/api/v1/vendor"])
+        check("ws sub: /api/v1/ gets everything", len(ev["/api/v1/"]) == 6, ev["/api/v1/"])
+        for bad in ("/api/v1/info", "/api/v1/spool/abc", "/api/v1/spool/"):
+            s = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
+            st, _ = ws_handshake(s, path=bad)
+            s.close()
+            check(f"ws sub: {bad} -> 404", st == 404, st)
+    finally:
+        srv.cleanup()
+
+
 def test_ui():
     srv = Server()
     try:
@@ -399,6 +543,113 @@ def test_ui():
 
         status, _, _ = http_json(srv.base_url(), "POST", "/")
         check("ui: POST / -> 405", status == 405)
+    finally:
+        srv.cleanup()
+
+
+def test_ui_security_headers():
+    import base64
+    import hashlib
+    srv = Server()
+    try:
+        srv.start()
+        raw = raw_http(srv.port, "GET", "/", {"Accept-Encoding": "gzip"})
+        head = raw.partition(b"\r\n\r\n")[0].decode(errors="replace")
+        hdrs = {}
+        for line in head.split("\r\n")[1:]:
+            k, _, v = line.partition(":")
+            hdrs[k.strip().lower()] = v.strip()
+        csp = hdrs.get("content-security-policy", "")
+        check("ui: X-Content-Type-Options: nosniff", hdrs.get("x-content-type-options") == "nosniff", head)
+        check("ui: X-Frame-Options: DENY", hdrs.get("x-frame-options") == "DENY", head)
+        ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "index.html")
+        with open(ui_path, "r", encoding="utf-8") as f:
+            script = re.search(r"<script>(.*?)</script>", f.read(), re.S).group(1)
+        h = "'sha256-" + base64.b64encode(hashlib.sha256(script.encode()).digest()).decode() + "'"
+        check("ui: CSP allows exactly the inline script by hash", f"script-src {h};" in csp, csp)
+        check("ui: CSP default-src 'none', frame-ancestors 'none'",
+              "default-src 'none'" in csp and "frame-ancestors 'none'" in csp, csp)
+        check("ui: CSP connect-src allows Moonraker (http://<host>:7125)",
+              re.search(r"connect-src [^;]*\bhttp:", csp) is not None, csp)
+        check("ui: CSP has no 'unsafe-inline' or 'unsafe-eval' for scripts",
+              "unsafe-eval" not in csp and "'unsafe-inline'" not in csp.split("script-src")[1].split(";")[0], csp)
+        status, _, hdrs2 = http_json(srv.base_url(), "GET", "/api/v1/health")
+        check("api: JSON responses carry nosniff", hdrs2.get("X-Content-Type-Options") == "nosniff", hdrs2)
+    finally:
+        srv.cleanup()
+
+
+def test_host_origin_content_type():
+    srv = Server()
+    try:
+        srv.start(extra_args=["-H", "printer.lan", "-o", "http://fluidd.lan"])
+        port = srv.port
+        hn = socket.gethostname().lower()
+
+        def st(host, method="GET", path="/api/v1/health", headers=None, body=b""):
+            h = dict(headers or {})
+            if body:
+                h.setdefault("Content-Length", str(len(body)))
+            return parse_status(raw_http(port, method, path, h, body=body, host=host))
+
+        check("host: 127.0.0.1:port accepted (what Moonraker sends)", st(f"127.0.0.1:{port}") == 200)
+        check("host: LAN IP literal accepted", st("192.168.1.56:7912") == 200)
+        check("host: [::1] literal accepted", st(f"[::1]:{port}") == 200)
+        check("host: localhost accepted", st(f"localhost:{port}") == 200)
+        check("host: machine hostname accepted", st(f"{hn}:{port}") == 200, hn)
+        check("host: hostname.local accepted", st(f"{hn}.local") == 200)
+        check("host: -H name accepted", st("Printer.LAN.") == 200)
+        check("host: missing Host header accepted (non-browser HTTP/1.0 style)", st(None) == 200)
+        check("host: foreign name -> 403 (DNS rebinding)", st("evil.example") == 403)
+        check("host: hostname as a prefix of another name -> 403", st(f"{hn}.evil.example") == 403)
+        check("host: junk port -> 403", st("127.0.0.1:abc") == 403)
+
+        vend = json.dumps({"name": "OriginTest"}).encode()
+        jh = {"Content-Type": "application/json"}
+        check("origin: none (Moonraker) -> POST 200", st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", jh, vend) == 200)
+        check("origin: same origin as Host -> POST 200",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": f"http://127.0.0.1:{port}"}, vend) == 200)
+        check("origin: default port normalised (http://a == a:80)",
+              st("192.168.1.56", "POST", "/api/v1/vendor", {**jh, "Origin": "http://192.168.1.56:80"}, vend) == 200)
+        check("origin: foreign page -> POST 403",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": "http://evil.example"}, vend) == 403)
+        check("origin: same host, other port -> 403",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": "http://127.0.0.1:1"}, vend) == 403)
+        check("origin: 'null' -> 403",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": "null"}, vend) == 403)
+        check("origin: foreign page -> DELETE 403",
+              st(f"127.0.0.1:{port}", "DELETE", "/api/v1/vendor/1", {"Origin": "http://evil.example"}) == 403)
+        check("origin: -o allowlisted origin -> POST 200",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": "http://fluidd.lan/"}, vend) == 200)
+        check("origin: GET with foreign Origin still answered (browser keeps it unreadable)",
+              st(f"127.0.0.1:{port}", "GET", "/api/v1/vendor", {"Origin": "http://evil.example"}) == 200)
+
+        def ws_status(headers, host=f"127.0.0.1:{port}"):
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            try:
+                return ws_handshake(s, headers=headers, host=host)[0]
+            finally:
+                s.close()
+        check("ws origin: no Origin (Moonraker/tornado) -> 101", ws_status({}) == 101)
+        check("ws origin: same origin -> 101", ws_status({"Origin": f"http://127.0.0.1:{port}"}) == 101)
+        check("ws origin: foreign page -> 403", ws_status({"Origin": "http://evil.example"}) == 403)
+        check("ws host: foreign Host -> 403", ws_status({}, host="evil.example") == 403)
+
+        status, before, _ = http_json(srv.base_url(), "GET", "/api/v1/vendor")
+        check("content-type: text/plain JSON POST -> 415",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {"Content-Type": "text/plain"}, vend) == 415)
+        check("content-type: form POST -> 415",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor",
+                 {"Content-Type": "application/x-www-form-urlencoded"}, b"name=x") == 415)
+        check("content-type: body without Content-Type -> 415",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {}, vend) == 415)
+        check("content-type: PATCH text/plain -> 415",
+              st(f"127.0.0.1:{port}", "PATCH", "/api/v1/vendor/1", {"Content-Type": "text/plain"}, b'{"name":"y"}') == 415)
+        status, after, _ = http_json(srv.base_url(), "GET", "/api/v1/vendor")
+        check("content-type: refused requests created nothing", len(before) == len(after))
+        check("content-type: application/json; charset=utf-8 accepted",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor",
+                 {"Content-Type": "Application/JSON; charset=utf-8"}, vend) == 200)
     finally:
         srv.cleanup()
 
@@ -550,6 +801,334 @@ def test_deferred_use_flush():
         srv.cleanup()
 
 
+def test_input_validation():
+    srv = Server()
+    try:
+        srv.start()
+        port, base = srv.port, srv.base_url()
+
+        def post(path, raw_body, method="POST"):
+            raw = raw_http(port, method, path, {"Content-Type": "application/json",
+                                                "Content-Length": str(len(raw_body))}, body=raw_body)
+            return parse_status(raw)
+
+        check("utf-8: invalid byte 0xff -> 400", post("/api/v1/vendor", b'{"name":"a\xffb"}') == 400)
+        check("utf-8: overlong '/' (c0 af) -> 400", post("/api/v1/vendor", b'{"name":"\xc0\xaf"}') == 400)
+        check("utf-8: UTF-8 encoded surrogate -> 400", post("/api/v1/vendor", b'{"name":"\xed\xa0\x80"}') == 400)
+        check("utf-8: truncated sequence -> 400", post("/api/v1/vendor", b'{"name":"\xe2\x82"}') == 400)
+        check("utf-8: above U+10FFFF -> 400", post("/api/v1/vendor", b'{"name":"\xf4\x90\x80\x80"}') == 400)
+        name = "Ä € 😀 ПЛА"
+        status, v, _ = http_json(base, "POST", "/api/v1/vendor", {"name": name})
+        check("utf-8: valid multi-byte text accepted and returned as is", status == 200 and v["name"] == name, v)
+
+        check("numbers: density 1e999 (inf) -> 400",
+              post("/api/v1/filament", b'{"density":1e999,"diameter":1.75}') == 400)
+        check("numbers: diameter -1e999 -> 400",
+              post("/api/v1/filament", b'{"density":1.24,"diameter":-1e999}') == 400)
+        check("numbers: price 1e10 (absurd) -> 400",
+              post("/api/v1/filament", b'{"density":1.24,"diameter":1.75,"price":1e10}') == 400)
+        check("numbers: vendor_id 1e20 (llround overflow) -> 400",
+              post("/api/v1/filament", b'{"density":1.24,"diameter":1.75,"vendor_id":1e20}') == 400)
+        check("numbers: settings_extruder_temp 3e9 -> 400",
+              post("/api/v1/filament", b'{"density":1.24,"diameter":1.75,"settings_extruder_temp":3e9}') == 400)
+        status, f, _ = http_json(base, "POST", "/api/v1/filament", {"density": 1.24, "diameter": 1.75, "weight": 1000})
+        status, sp, _ = http_json(base, "POST", "/api/v1/spool", {"filament_id": f["id"]})
+        check("numbers: use_weight 1e999 -> 400",
+              post(f"/api/v1/spool/{sp['id']}/use", b'{"use_weight":1e999}', "PUT") == 400)
+        status, sp2, _ = http_json(base, "GET", f"/api/v1/spool/{sp['id']}")
+        check("numbers: rejected use left used_weight unchanged", sp2["used_weight"] == 0, sp2)
+
+        status, _, _ = http_json(base, "PATCH", f"/api/v1/spool/{sp['id']}", {"extra": {"a": 1}})
+        check("extra: number value -> 400 (Spoolman stores strings only)", status == 400)
+        status, _, _ = http_json(base, "PATCH", f"/api/v1/spool/{sp['id']}", {"extra": {"a": {"b": "c"}}})
+        check("extra: object value -> 400", status == 400)
+        status, sp3, _ = http_json(base, "PATCH", f"/api/v1/spool/{sp['id']}", {"extra": {"a": "1", "b": "\"x\""}})
+        check("extra: string values accepted", status == 200 and sp3["extra"] == {"a": "1", "b": "\"x\""}, sp3)
+    finally:
+        srv.cleanup()
+
+
+def start_with_datafile(content, extra_files=None):
+    """Writes `content` as the data file (plus optional other files) and starts
+    the binary; returns (proc or None if it exited, rc, stderr, tmpdir, datafile)."""
+    tmpdir = tempfile.mkdtemp(prefix="microspool_test_df_")
+    datafile = os.path.join(tmpdir, "microspool.json")
+    if content is not None:
+        with open(datafile, "w", encoding="utf-8") as fh:
+            fh.write(content if isinstance(content, str) else json.dumps(content))
+    for name, data in (extra_files or {}).items():
+        with open(os.path.join(tmpdir, name), "w", encoding="utf-8") as fh:
+            fh.write(data if isinstance(data, str) else json.dumps(data))
+    srv = Server(datafile=datafile, tmpdir=tmpdir)
+    srv.start(wait_ready=False)
+    try:
+        srv.wait_ready(timeout=3)
+        return srv, None, ""
+    except RuntimeError as e:
+        rc = srv.proc.returncode
+        return srv, rc, str(e)
+
+
+def db(vendors=(), filaments=(), spools=(), next_id=None):
+    return {"version": 1, "next_id": next_id or {"vendor": 1, "filament": 1, "spool": 1},
+            "vendors": list(vendors), "filaments": list(filaments), "spools": list(spools)}
+
+
+def test_datafile_id_validation():
+    v = lambda i: {"id": i, "registered": "2026-01-01T00:00:00+00:00", "name": f"V{i}", "extra": {}}
+    cases = [
+        ("duplicate vendor id", db(vendors=[v(1), v(1)])),
+        ("id INT_MAX (next id would overflow)", db(vendors=[v(2147483647)])),
+        ("fractional id", db(vendors=[v(1.5)])),
+        ("id 0", db(vendors=[v(0)])),
+    ]
+    for label, content in cases:
+        srv, rc, err = start_with_datafile(content)
+        try:
+            check(f"data file: {label} -> refuses to start (rc 1)", rc == 1, f"rc={rc} {err[-200:]}")
+        finally:
+            srv.cleanup()
+
+    srv, rc, err = start_with_datafile(db(vendors=[dict(v(3), extra={"n": 5, "s": "x"})],
+                                          next_id={"vendor": 2147483647 * 4, "filament": -5, "spool": "x"}))
+    try:
+        check("data file: absurd next_id values tolerated", rc is None, err)
+        if rc is None:
+            status, got, _ = http_json(srv.base_url(), "GET", "/api/v1/vendor/3")
+            check("data file: old non-string extra value migrated to its JSON text",
+                  status == 200 and got["extra"] == {"n": "5", "s": "x"}, got)
+            status, nv, _ = http_json(srv.base_url(), "POST", "/api/v1/vendor", {"name": "next"})
+            check("data file: next id continues after the highest id", status == 200 and nv["id"] == 4, nv)
+    finally:
+        srv.cleanup()
+
+
+def read_json(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_backup_and_fallback():
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        http_json(base, "POST", "/api/v1/vendor", {"name": "First"})
+        check("bak: no .bak after the very first save", not os.path.exists(srv.datafile + ".bak"))
+        http_json(base, "POST", "/api/v1/vendor", {"name": "Second"})
+        bak = read_json(srv.datafile + ".bak")
+        main = read_json(srv.datafile)
+        check("bak: .bak holds the previous version", [v["name"] for v in bak["vendors"]] == ["First"], bak)
+        check("bak: main file holds the current version", [v["name"] for v in main["vendors"]] == ["First", "Second"])
+        srv.stop()
+
+        damaged = '{"version": 1, "vendors": [truncated'
+        with open(srv.datafile, "w", encoding="utf-8") as fh:
+            fh.write(damaged)
+        srv2 = Server(datafile=srv.datafile, tmpdir=srv.tmpdir)
+        srv2.start()
+        status, lst, _ = http_json(srv2.base_url(), "GET", "/api/v1/vendor")
+        check("bak: damaged main file -> starts from .bak", status == 200 and [v["name"] for v in lst] == ["First"], lst)
+        time.sleep(0.3)
+        check("bak: main file repaired from the loaded data",
+              [v["name"] for v in read_json(srv.datafile)["vendors"]] == ["First"])
+        with open(srv.datafile + ".corrupt", "r", encoding="utf-8") as fh:
+            check("bak: damaged main file kept as .corrupt", fh.read() == damaged)
+        check("bak: .bak left as it was", [v["name"] for v in read_json(srv.datafile + ".bak")["vendors"]] == ["First"])
+        rc = srv2.stop()
+        err = srv2.proc.stderr.read().decode(errors="replace")
+        check("bak: fallback is logged loudly", "WARNING" in err and ".bak" in err, err[-300:])
+        check("bak: clean exit after fallback", rc == 0, f"rc={rc}")
+    finally:
+        srv.cleanup()
+
+    srv, rc, err = start_with_datafile("not json", extra_files={"microspool.json.bak": "also not json"})
+    try:
+        check("bak: main and .bak both damaged -> refuses to start (rc 1)", rc == 1, f"rc={rc}")
+        with open(srv.datafile) as a, open(srv.datafile + ".bak") as b:
+            check("bak: neither damaged file was changed", a.read() == "not json" and b.read() == "also not json")
+        check("bak: no .corrupt written when refusing", not os.path.exists(srv.datafile + ".corrupt"))
+    finally:
+        srv.cleanup()
+
+
+def test_unreadable_datafile():
+    if os.geteuid() == 0:
+        print("[SKIP] unreadable data file: running as root, permissions are not enforced")
+        return
+    tmpdir = tempfile.mkdtemp(prefix="microspool_test_perm_")
+    datafile = os.path.join(tmpdir, "microspool.json")
+    with open(datafile, "w") as fh:
+        json.dump(db(vendors=[{"id": 1, "name": "Keep", "registered": "", "extra": {}}]), fh)
+    os.chmod(datafile, 0)
+    srv = Server(datafile=datafile, tmpdir=tmpdir)
+    try:
+        srv.start(wait_ready=False)
+        try:
+            srv.wait_ready(timeout=3)
+            rc = None
+        except RuntimeError:
+            rc = srv.proc.returncode
+        check("data file: unreadable (EACCES) is fatal, not an empty database", rc == 1, f"rc={rc}")
+    finally:
+        os.chmod(datafile, 0o644)
+        srv.cleanup()
+
+
+def test_temp_files():
+    tmpdir = tempfile.mkdtemp(prefix="microspool_test_tmp_")
+    datafile = os.path.join(tmpdir, "microspool.json")
+    for name in ("microspool.json.tmp-99999", "microspool.json.bak.tmp-12", "other.tmp-1"):
+        with open(os.path.join(tmpdir, name), "w") as fh:
+            fh.write("stale")
+    srv = Server(datafile=datafile, tmpdir=tmpdir)
+    try:
+        srv.start()
+        left = sorted(os.listdir(tmpdir))
+        check("tmp: stale <datafile>.tmp-* and .bak.tmp-* removed at start, others kept",
+              "microspool.json.tmp-99999" not in left and "microspool.json.bak.tmp-12" not in left
+              and "other.tmp-1" in left, left)
+        target = os.path.join(tmpdir, "victim")
+        with open(target, "w") as fh:
+            fh.write("untouched")
+        os.symlink(target, f"{datafile}.tmp-{srv.proc.pid}")
+        status, _, _ = http_json(srv.base_url(), "POST", "/api/v1/vendor", {"name": "SymlinkTest"})
+        with open(target) as fh:
+            check("tmp: planted symlink at the temp name is not followed", fh.read() == "untouched")
+        check("tmp: save still succeeds", status == 200 and
+              [v["name"] for v in read_json(datafile)["vendors"]] == ["SymlinkTest"])
+    finally:
+        srv.cleanup()
+
+
+def test_failed_save():
+    if os.geteuid() == 0:
+        print("[SKIP] failed save: running as root, a read-only directory does not stop writes")
+        return
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        status, v, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "Before"})
+        status, f, _ = http_json(base, "POST", "/api/v1/filament", {"density": 1.24, "diameter": 1.75, "weight": 1000})
+        status, sp, _ = http_json(base, "POST", "/api/v1/spool", {"filament_id": f["id"]})
+        os.chmod(srv.tmpdir, 0o555)
+        try:
+            status, body, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "Lost"})
+            check("failed save: POST -> 500", status == 500, f"{status} {body}")
+            status, lst, _ = http_json(base, "GET", "/api/v1/vendor")
+            check("failed save: POST rolled back (not in the list)", [x["name"] for x in lst] == ["Before"], lst)
+            status, _, _ = http_json(base, "PATCH", f"/api/v1/vendor/{v['id']}", {"name": "Renamed"})
+            status2, got, _ = http_json(base, "GET", f"/api/v1/vendor/{v['id']}")
+            check("failed save: PATCH -> 500 and rolled back", status == 500 and got["name"] == "Before", got)
+            status, _, _ = http_json(base, "DELETE", f"/api/v1/vendor/{v['id']}")
+            status2, _, _ = http_json(base, "GET", f"/api/v1/vendor/{v['id']}")
+            check("failed save: DELETE -> 500 and rolled back", status == 500 and status2 == 200)
+            status, nv, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "x"})
+            status, _, _ = http_json(base, "GET", "/api/v1/vendor")
+            status, used, _ = http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 7})
+            check("failed save: deferred use still answers 200", status == 200)
+        finally:
+            os.chmod(srv.tmpdir, 0o755)
+        status, nv, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "After"})
+        check("failed save: ids not burnt by rolled-back creates", status == 200 and nv["id"] == v["id"] + 1, nv)
+        saved = next(x for x in read_json(srv.datafile)["spools"] if x["id"] == sp["id"])
+        check("failed save: use kept dirty and written by the next save", abs(saved["used_weight"] - 7) < 1e-9, saved)
+        srv.stop()
+        err = srv.proc.stderr.read().decode(errors="replace")
+        check("failed save: failure logged once, recovery logged", err.count("will retry") == 1 and "again" in err, err[-400:])
+    finally:
+        os.chmod(srv.tmpdir, 0o755)
+        srv.cleanup()
+
+    # a failed deferred save is retried on its own once the disk is writable again
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        status, f, _ = http_json(base, "POST", "/api/v1/filament", {"density": 1.24, "diameter": 1.75, "weight": 1000})
+        status, sp, _ = http_json(base, "POST", "/api/v1/spool", {"filament_id": f["id"]})
+        os.chmod(srv.tmpdir, 0o555)
+        http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 11})
+        time.sleep(6.0)   # deferred save due after 5 s, fails
+        os.chmod(srv.tmpdir, 0o755)
+        time.sleep(1.5)   # retried within SAVE_RETRY_S
+        saved = next(x for x in read_json(srv.datafile)["spools"] if x["id"] == sp["id"])
+        check("failed save: deferred save retried after the disk recovers", abs(saved["used_weight"] - 11) < 1e-9, saved)
+    finally:
+        os.chmod(srv.tmpdir, 0o755)
+        srv.cleanup()
+
+
+def test_deferred_flush_timing_and_sighup():
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        status, f, _ = http_json(base, "POST", "/api/v1/filament", {"density": 1.24, "diameter": 1.75, "weight": 1000})
+        status, sp, _ = http_json(base, "POST", "/api/v1/spool", {"filament_id": f["id"]})
+        used = lambda: next(x for x in read_json(srv.datafile)["spools"] if x["id"] == sp["id"])["used_weight"]
+        t0 = time.time()
+        http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 5})
+        time.sleep(3.5)
+        http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 5})
+        check("deferred use: not written after 3.5 s", used() == 0)
+        while time.time() - t0 < 7 and used() == 0:
+            time.sleep(0.1)
+        dt = time.time() - t0
+        check("deferred use: written ~5 s after the first unsaved use (not 30 s)",
+              used() == 10 and 4.5 <= dt <= 6.5, f"used={used()} dt={dt:.2f}")
+        http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 1})
+        srv.proc.send_signal(signal.SIGHUP)
+        time.sleep(0.4)
+        check("SIGHUP: pending use saved at once", used() == 11, used())
+        check("SIGHUP: server keeps running", srv.proc.poll() is None and
+              http_json(base, "GET", "/api/v1/health")[0] == 200)
+        http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 1})
+        rc = srv.stop(signal.SIGINT)
+        check("SIGINT: pending use saved on exit (rc 0)", rc == 0 and used() == 12, f"rc={rc} used={used()}")
+    finally:
+        srv.cleanup()
+
+
+def test_lan_write_rate_limit():
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        status, v, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "Rate"})
+        body = json.dumps({"comment": "x"}).encode()
+        req = (f"PATCH /api/v1/vendor/{v['id']} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+               f"Content-Length: {len(body)}\r\n\r\n").encode() + body
+        mtimes = set()
+        t0 = time.time()
+        codes = []
+        for i in range(8):
+            s = lan_socket(srv.port, "127.0.0.2", timeout=5)
+            s.sendall(req)
+            data = b""
+            try:
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except socket.timeout:
+                pass
+            s.close()
+            codes.append(parse_status(data) if data else None)
+        lan_dt = time.time() - t0
+        check("rate limit: all 8 LAN PATCHes answered 200", codes == [200] * 8, codes)
+        check("rate limit: LAN writes after a burst of 5 slowed to ~1 per second",
+              2.5 <= lan_dt <= 5.0, f"dt={lan_dt:.2f}")
+        t0 = time.time()
+        ok = all(http_json(base, "PATCH", f"/api/v1/vendor/{v['id']}", {"comment": str(i)})[0] == 200 for i in range(10))
+        local_dt = time.time() - t0
+        check("rate limit: local clients (Moonraker) are never held", ok and local_dt < 1.5, f"dt={local_dt:.2f}")
+    finally:
+        srv.cleanup()
+
+
 def test_corrupt_file():
     tmpdir = tempfile.mkdtemp(prefix="microspool_test_corrupt_")
     datafile = os.path.join(tmpdir, "microspool.json")
@@ -671,38 +1250,257 @@ def test_websocket():
 # Лимит соединений и утечки
 # ---------------------------------------------------------------------------
 
+def lan_socket(port, src, timeout=3.0, rcvbuf=None):
+    """TCP connection from another loopback address (127.0.0.x, x != 1): the
+    server treats it like a LAN client, which lets the tests exercise the
+    limits that protect Moonraker's 127.0.0.1 connections."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if rcvbuf:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+    s.settimeout(timeout)
+    s.bind((src, 0))
+    s.connect(("127.0.0.1", port))
+    return s
+
+
+def closed_by_server(s, wait=1.5):
+    """True if the server closed the socket within `wait` seconds."""
+    s.settimeout(wait)
+    try:
+        return s.recv(4096) == b""
+    except socket.timeout:
+        return False
+    except (ConnectionResetError, BrokenPipeError):
+        return True
+
+
+def http_on(sock, path="/api/v1/health", host="127.0.0.1"):
+    sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
+    data = b""
+    try:
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (socket.timeout, ConnectionResetError):
+        pass
+    return parse_status(data) if data else None
+
+
 def test_connection_limit():
+    """32 slots; LAN clients get at most 28 and 8 per address; 127.0.0.1 is never starved."""
+    srv = Server()
+    socks = []
+    try:
+        srv.start()
+        port = srv.port
+        t0 = time.time()
+        # 28 idle LAN-like connections from 4 addresses fill the LAN pool
+        for src, n in (("127.0.0.2", 8), ("127.0.0.3", 8), ("127.0.0.4", 8), ("127.0.0.5", 4)):
+            for _ in range(n):
+                socks.append(lan_socket(port, src))
+        time.sleep(0.2)
+        extra_peer = lan_socket(port, "127.0.0.2")
+        check("conn limit: 9th connection from one LAN address is closed", closed_by_server(extra_peer))
+        extra_peer.close()
+        extra_pool = lan_socket(port, "127.0.0.6")
+        check("conn limit: LAN pool full (28) -> new LAN connection closed", closed_by_server(extra_pool, 0.5))
+        extra_pool.close()
+
+        ok = all(http_json(srv.base_url(), "GET", "/api/v1/health")[0] == 200 for _ in range(5))
+        check("conn limit: 127.0.0.1 still served while LAN clients hold 28 slots", ok)
+
+        # take the 4 reserved slots with idle local sockets: all 32 slots in use
+        local_idle = [socket.create_connection(("127.0.0.1", port), timeout=3) for _ in range(4)]
+        socks += local_idle
+        time.sleep(0.2)
+        status, body, _ = http_json(srv.base_url(), "GET", "/api/v1/health")
+        check("conn limit: local client evicts a LAN connection when all 32 slots are taken",
+              status == 200 and body.get("status") == "healthy", f"{status} {body}")
+
+        # after EVICT_MIN_AGE_S a new LAN client may push out the oldest idle LAN socket
+        time.sleep(max(0, 1.3 - (time.time() - t0)))
+        newcomer = lan_socket(port, "127.0.0.7")
+        check("conn limit: new LAN client evicts an idle LAN socket older than 1 s",
+              http_on(newcomer) == 200)
+        newcomer.close()
+        check("conn limit: test finished before the 10 s request deadline", time.time() - t0 < 9)
+    finally:
+        for s in socks:
+            try:
+                s.close()
+            except Exception:
+                pass
+        srv.cleanup()
+
+
+def test_slowloris_deadline():
+    """A client that trickles header bytes is cut off 10 s after connecting."""
     srv = Server()
     try:
         srv.start()
-        socks = []
-        try:
-            for i in range(8):
-                s = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
-                socks.append(s)
-            # 9-е соединение сервер обязан принять и сразу закрыть
-            s9 = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
-            s9.settimeout(2.0)
-            data = b""
+        s = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
+        t0 = time.time()
+        s.sendall(b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        closed_at = None
+        got = b""
+        while time.time() - t0 < 14:
             try:
-                data = s9.recv(4096)
+                s.sendall(b"X-Slow: 1\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                closed_at = time.time() - t0
+                break
+            s.settimeout(0.5)
+            try:
+                chunk = s.recv(4096)
+                if chunk == b"":
+                    closed_at = time.time() - t0
+                    break
+                got += chunk
             except socket.timeout:
                 pass
-            check("conn limit: 9-е соединение закрыто сервером (EOF)", data == b"", f"got {data!r}")
-            s9.close()
+            except ConnectionResetError:
+                closed_at = time.time() - t0
+                break
+        s.close()
+        check("slowloris: trickling client closed at the 10 s deadline",
+              closed_at is not None and 9.0 <= closed_at <= 12.0, f"closed_at={closed_at}")
+        check("slowloris: no response was sent to the incomplete request", got == b"", got[:80])
+        status, _, _ = http_json(srv.base_url(), "GET", "/api/v1/health")
+        check("slowloris: server still serves others", status == 200)
 
-            # сервер по-прежнему жив: закрываем один слот и делаем обычный запрос
-            socks[0].close()
-            socks = socks[1:]
-            time.sleep(0.1)
-            status, body, _ = http_json(srv.base_url(), "GET", "/api/v1/health")
-            check("conn limit: сервер жив после лимита", status == 200 and body.get("status") == "healthy")
-        finally:
-            for s in socks:
-                try:
-                    s.close()
-                except Exception:
-                    pass
+        # a complete request followed by a stream of junk: answered, junk not buffered
+        s = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
+        s.sendall(b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n" + b"x" * 200000)
+        data = b""
+        try:
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        except (socket.timeout, ConnectionResetError):
+            pass
+        s.close()
+        check("closing state: request + trailing junk still answered 200", parse_status(data) == 200 if data else False)
+    finally:
+        srv.cleanup()
+
+
+def ws_handshake(sock, path="/api/v1/spool", headers=None, host="127.0.0.1"):
+    key = "dGhlIHNhbXBsZSBub25jZQ=="
+    lines = [f"GET {path} HTTP/1.1", f"Host: {host}", "Upgrade: websocket", "Connection: Upgrade",
+             f"Sec-WebSocket-Key: {key}", "Sec-WebSocket-Version: 13"]
+    for k, v in (headers or {}).items():
+        lines.append(f"{k}: {v}")
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    head, _, rest = data.partition(b"\r\n\r\n")
+    return parse_status(head) if head else None, rest
+
+
+def ws_frame(opcode, payload=b"", mask=b"\x01\x02\x03\x04"):
+    hdr = bytes([0x80 | opcode])
+    n = len(payload)
+    if n < 126:
+        hdr += bytes([0x80 | n])
+    elif n <= 0xFFFF:
+        hdr += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+    else:
+        hdr += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+    return hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def test_ws_ping_interval_and_timeout():
+    srv = Server()
+    try:
+        srv.start(extra_args=["-k", "1"])
+        s = socket.create_connection(("127.0.0.1", srv.port), timeout=5)
+        status, rest = ws_handshake(s)
+        check("ws -k 1: handshake 101", status == 101)
+        t0 = time.time()
+        data = rest
+        s.settimeout(2.0)
+        try:
+            while len(data) < 2:
+                data += s.recv(64)
+        except socket.timeout:
+            pass
+        check("ws -k 1: server ping arrives after ~1 s (uses -k, not the 20 s default)",
+              len(data) >= 2 and data[0] == 0x89 and time.time() - t0 < 1.8, f"{data[:4]!r} t={time.time()-t0:.2f}")
+        # never answer: the server must drop us after 3 intervals of silence
+        closed_at = None
+        s.settimeout(0.5)
+        while time.time() - t0 < 8:
+            try:
+                chunk = s.recv(64)
+                if chunk == b"":
+                    closed_at = time.time() - t0
+                    break
+            except socket.timeout:
+                pass
+            except ConnectionResetError:
+                closed_at = time.time() - t0
+                break
+        s.close()
+        check("ws -k 1: silent peer closed after ~3 s", closed_at is not None and 2.5 <= closed_at <= 5.0,
+              f"closed_at={closed_at}")
+
+        async def tornado_client(ping_interval):
+            from tornado.websocket import websocket_connect
+            conn = await websocket_connect(f"ws://127.0.0.1:{srv.port}/api/v1/spool",
+                                           connect_timeout=5.0, ping_interval=ping_interval)
+            fut = asyncio.ensure_future(conn.read_message())
+            await asyncio.sleep(5.0)
+            alive = not fut.done()
+            conn.close()
+            fut.cancel()
+            return alive
+
+        # Moonraker with tornado < 6.5 sends no pings itself; tornado answers ours.
+        check("ws -k 1: tornado client without own pings stays connected 5 s",
+              asyncio.run(tornado_client(None)))
+        check("ws -k 1: tornado client with 20 s pings (Moonraker, tornado >= 6.5) stays connected 5 s",
+              asyncio.run(tornado_client(20.0)))
+    finally:
+        srv.cleanup()
+
+
+def test_ws_slow_reader_capped():
+    """A websocket client that never reads cannot grow server memory via pong echoes."""
+    srv = Server()
+    try:
+        srv.start(extra_args=["-k", "0"])
+        rss0 = get_rss_kb(srv.proc.pid)
+        s = lan_socket(srv.port, "127.0.0.2", timeout=5, rcvbuf=4096)
+        status, _ = ws_handshake(s)
+        check("ws slow reader: handshake 101", status == 101)
+        ping = ws_frame(0x9, b"p" * 125)
+        burst = ping * 512
+        sent = 0
+        dropped = False
+        s.settimeout(2.0)
+        t0 = time.time()
+        while sent < 40 * 1024 * 1024 and time.time() - t0 < 20:
+            try:
+                s.sendall(burst)
+                sent += len(burst)
+            except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                dropped = True
+                break
+        rss1 = get_rss_kb(srv.proc.pid)
+        s.close()
+        check("ws slow reader: server dropped the non-reading client", dropped, f"sent={sent}")
+        check(f"ws slow reader: RSS stayed bounded (before={rss0}KB after={rss1}KB)",
+              rss1 - rss0 < 2048, f"delta={rss1 - rss0}KB")
+        status, _, _ = http_json(srv.base_url(), "GET", "/api/v1/health")
+        check("ws slow reader: server still alive", status == 200)
     finally:
         srv.cleanup()
 
@@ -757,15 +1555,30 @@ def main():
     finally:
         srv.cleanup()
 
+    test_api_gaps()
+    test_ws_subscriptions()
     test_ui()
     test_ui_disabled()
+    test_ui_security_headers()
+    test_host_origin_content_type()
     test_ui_js_syntax()
     test_settings_and_lists()
     test_persistence()
     test_deferred_use_flush()
     test_corrupt_file()
+    test_backup_and_fallback()
+    test_unreadable_datafile()
+    test_temp_files()
+    test_failed_save()
+    test_deferred_flush_timing_and_sighup()
+    test_lan_write_rate_limit()
+    test_input_validation()
+    test_datafile_id_validation()
     test_websocket()
     test_connection_limit()
+    test_slowloris_deadline()
+    test_ws_ping_interval_and_timeout()
+    test_ws_slow_reader_capped()
     test_no_leak_2000_requests()
 
     print(f"\n{PASSES} passed, {len(FAILURES)} failed")

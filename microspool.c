@@ -29,6 +29,7 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #include "vendor/cJSON.h"
 
@@ -48,14 +49,30 @@
 #define EXTRA_CAP       1024   /* буфер под сериализованный JSON "extra" */
 
 #define BODY_LIMIT      16384  /* тело запроса <= 16 КБ, иначе 413 */
+#define NUM_ABS_MAX     1e9    /* numbers in requests: finite and |x| <= 1e9 (1000 t of filament) */
 #define HEADER_LIMIT    8192   /* защита от неограниченного роста буфера заголовков */
 
-#define MAX_CONNS       8
-#define LISTEN_BACKLOG  16
+/* Connections. Moonraker keeps one websocket open all the time and makes short
+   HTTP requests; the web UI is reachable from the LAN without a login, so LAN
+   clients must never be able to take the slots Moonraker needs. */
+#define MAX_CONNS             32
+#define LOCAL_RESERVED_CONNS  4     /* slots LAN clients can never take */
+#define MAX_CONNS_PER_PEER    8     /* per LAN address */
+#define MAX_REMOTE_WS         4     /* websockets from LAN addresses, in total */
+#define EVICT_MIN_AGE_S       1.0   /* a LAN request still incomplete after this may be evicted */
+#define LISTEN_BACKLOG        32
 
-#define HTTP_IDLE_TIMEOUT_S   10
+#define HTTP_REQUEST_DEADLINE_S 10  /* accept -> response sent, whatever the client does (slowloris) */
 #define WS_PING_INTERVAL_S    20      /* по умолчанию; -k задаёт своё, -k 0 отключает пинги сервера */
-#define USE_FLUSH_INTERVAL_S  30
+#define WS_TIMEOUT_PINGS      3     /* websocket closed after this many ping intervals without any byte from the peer */
+
+#define BUF_KEEP_CAP          16384             /* per-slot buffers up to this size are reused */
+#define WS_TX_LIMIT           (256 * 1024)      /* unsent bytes per websocket peer before it is dropped */
+#define TX_TOTAL_LIMIT        (8 * 1024 * 1024) /* all send buffers together */
+#define USE_FLUSH_INTERVAL_S  5     /* deferred "use" saves: at most this much usage lost on power cut */
+#define SAVE_RETRY_S          1.0   /* retry interval after a failed save (disk full, read-only) */
+#define SAVE_BURST            5     /* LAN write requests saved at once before rate limiting */
+#define SAVE_TOKEN_S          1.0   /* then one save per this many seconds for LAN clients */
 
 /* Версия Spoolman API, которую мы изображаем в /api/v1/info (клиенты сверяют), и собственная версия. */
 static int g_ws_ping_interval = WS_PING_INTERVAL_S;
@@ -73,6 +90,15 @@ static int         g_listen_port = 7912;
 static const char *g_data_path   = "./microspool.json";
 static int         g_verbose     = 0;
 static int         g_ui_enabled  = 1;   /* -U отключает встроенный веб-интерфейс */
+
+/* Host / Origin allowlists (see request_allowed). */
+#define MAX_ALLOW_NAMES 16
+static const char *g_allow_hosts[MAX_ALLOW_NAMES];    /* -H name (or -H '*' for any) */
+static int         g_allow_hosts_n = 0;
+static int         g_allow_any_host = 0;
+static const char *g_allow_origins[MAX_ALLOW_NAMES];  /* -o http://host[:port] */
+static int         g_allow_origins_n = 0;
+static char        g_hostname[256];                   /* gethostname(), lower case */
 
 static volatile sig_atomic_t g_should_exit = 0;
 
@@ -93,10 +119,11 @@ static void log_v(const char *fmt, ...) {
 static void now_iso(char *buf, size_t bufsz) {
     time_t t = time(NULL);
     struct tm tmv;
-    gmtime_r(&t, &tmv);
-    snprintf(buf, bufsz, "%04d-%02d-%02dT%02d:%02d:%02d+00:00",
-              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-              tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    /* strftime instead of snprintf("%04d..."): no -Wformat-truncation, and a
+       year past 9999 just yields an empty string instead of a cut-off one. */
+    if (gmtime_r(&t, &tmv) == NULL || strftime(buf, bufsz, "%Y-%m-%dT%H:%M:%S+00:00", &tmv) == 0) {
+        if (bufsz) buf[0] = 0;
+    }
 }
 
 static double mono_now(void) {
@@ -290,10 +317,29 @@ static int g_next_vendor_id = 1;
 static int g_next_filament_id = 1;
 static int g_next_spool_id = 1;
 
-static int g_data_dirty_immediate = 0;   /* нужен немедленный сброс на диск */
-static int g_use_pending = 0;            /* есть отложенное изменение use */
-static double g_last_use_flush_mono = 0; /* когда последний раз сбрасывали use */
-static double g_use_flush_deadline = 0;  /* когда сбросить отложенное use */
+/* Saving. Create/patch/delete are written before the client gets its answer
+   (200 only once the change is on disk, 500 and rolled back if the write
+   fails). Use reports from Moonraker (every few seconds while printing) only
+   mark the data dirty and are flushed USE_FLUSH_INTERVAL_S after the first
+   unsaved one, on SIGHUP and on exit. A failed save keeps the data dirty and is
+   retried every SAVE_RETRY_S. */
+static int    g_dirty = 0;           /* unsaved changes in memory */
+static double g_save_due = 0;        /* when the background save runs (valid if g_dirty) */
+static double g_last_fail_log = -1e9;
+static int    g_main_damaged = 0;    /* loaded from .bak: keep the damaged main file as .corrupt */
+static char   g_data_dir[1024] = "."; /* directory of g_data_path, for fsync and cleanup */
+static char   g_bak_path[1100];
+static char   g_corrupt_path[1100];
+
+/* Write-rate limit for LAN clients: a burst of SAVE_BURST synchronous saves,
+   then one per SAVE_TOKEN_S. A LAN request that would save while the bucket
+   is empty waits (CS_HTTP_HELD) until a token is free, so a client looping
+   PATCH cannot make us rewrite and fsync the file hundreds of times a second
+   (eMMC wear). Local clients (Moonraker, HelixScreen) are never held. The
+   cost is latency for a LAN client doing more than SAVE_BURST writes in a row:
+   about one answer per second after the burst. */
+static double g_save_tokens = SAVE_BURST;
+static double g_tokens_mono = 0;
 
 /* ------------------------------------------------------------------------ */
 /* Вспомогательные функции по сущностям                                    */
@@ -327,6 +373,50 @@ static Spool *spool_free_slot(void) {
     for (int i = 0; i < MAX_SPOOLS; i++) if (g_spools[i].id == 0) return &g_spools[i];
     return NULL;
 }
+
+/* Undo log for one write request: handlers record each record before changing
+   it, and if the save that follows fails, everything is put back so the client's
+   500 means "nothing changed". A vendor delete touches at most every filament. */
+typedef struct { void *slot; void *copy; size_t size; } UndoEntry;
+static UndoEntry g_undo[2 + MAX_FILAMENTS];
+static int g_undo_n = 0, g_undo_active = 0;
+static int g_undo_next_ids[3];
+
+static void undo_begin(void) {
+    g_undo_n = 0;
+    g_undo_active = 1;
+    g_undo_next_ids[0] = g_next_vendor_id;
+    g_undo_next_ids[1] = g_next_filament_id;
+    g_undo_next_ids[2] = g_next_spool_id;
+}
+
+/* -1 = out of memory (the handler must fail without changing anything). */
+static int undo_record(void *slot, size_t size) {
+    if (!g_undo_active) return 0;
+    if (g_undo_n >= (int)(sizeof g_undo / sizeof g_undo[0])) return -1;
+    void *copy = malloc(size);
+    if (!copy) return -1;
+    memcpy(copy, slot, size);
+    g_undo[g_undo_n].slot = slot; g_undo[g_undo_n].copy = copy; g_undo[g_undo_n].size = size;
+    g_undo_n++;
+    return 0;
+}
+
+static void undo_end(int rollback) {
+    for (int i = g_undo_n - 1; i >= 0; i--) {
+        if (rollback) memcpy(g_undo[i].slot, g_undo[i].copy, g_undo[i].size);
+        free(g_undo[i].copy);
+    }
+    if (rollback && g_undo_active) {
+        g_next_vendor_id = g_undo_next_ids[0];
+        g_next_filament_id = g_undo_next_ids[1];
+        g_next_spool_id = g_undo_next_ids[2];
+    }
+    g_undo_n = 0;
+    g_undo_active = 0;
+}
+
+#define UNDO_OR_FAIL(p) do { if (undo_record((p), sizeof *(p)) != 0) { snprintf(msg, msgsz, "out of memory"); return 503; } } while (0)
 
 /* сортировка списков по id по возрастанию (для стабильного порядка выдачи) */
 static int cmp_int(const void *a, const void *b) {
@@ -366,6 +456,9 @@ static int jget_number(const cJSON *obj, const char *key, double *out,
     if (!item) return 0;
     if (cJSON_IsNull(item)) return 0;
     if (!cJSON_IsNumber(item)) return -1;
+    /* cJSON turns 1e999 into inf, which would pass every "> 0" check; also keeps
+       llround() in jget_int well inside int range. */
+    if (!isfinite(item->valuedouble) || fabs(item->valuedouble) > NUM_ABS_MAX) return -1;
     *out = item->valuedouble;
     *has = 1;
     return 0;
@@ -394,7 +487,9 @@ static int jget_bool(const cJSON *obj, const char *key, int *out,
 }
 
 /* extra: объект произвольных строковых значений; храним как сериализованный
-   компактный JSON-текст. present/has по тем же правилам, что и выше. */
+   компактный JSON-текст. present/has по тем же правилам, что и выше. Like
+   Spoolman, every value must be a string (clients store JSON-encoded values
+   in it, e.g. "\"PLA+\"" or "0.0400"). */
 static int jget_extra(const cJSON *obj, char *buf, size_t bufsz,
                        int *present, int *has) {
     cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, "extra");
@@ -403,6 +498,8 @@ static int jget_extra(const cJSON *obj, char *buf, size_t bufsz,
     if (!item) return 0;
     if (cJSON_IsNull(item)) return 0;
     if (!cJSON_IsObject(item)) return -1;
+    const cJSON *ch;
+    cJSON_ArrayForEach(ch, item) if (!cJSON_IsString(ch) || ch->string == NULL) return -1;
     char *s = cJSON_PrintUnformatted(item);
     if (!s) return -1;
     size_t len = strlen(s);
@@ -411,6 +508,33 @@ static int jget_extra(const cJSON *obj, char *buf, size_t bufsz,
     free(s);
     *has = 1;
     return 0;
+}
+
+/* Strict UTF-8 check (no overlong forms, no surrogates, <= U+10FFFF). cJSON
+   copies string bytes as they are, so invalid UTF-8 would be stored and later
+   sent to clients that fail to decode it. */
+static int utf8_valid(const unsigned char *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = s[i];
+        if (c < 0x80) { i++; continue; }
+        size_t len;
+        uint32_t cp;
+        if (c >= 0xC2 && c <= 0xDF)      { len = 2; cp = c & 0x1Fu; }
+        else if (c >= 0xE0 && c <= 0xEF) { len = 3; cp = c & 0x0Fu; }
+        else if (c >= 0xF0 && c <= 0xF4) { len = 4; cp = c & 0x07u; }
+        else return 0;
+        if (n - i < len) return 0;
+        for (size_t k = 1; k < len; k++) {
+            if ((s[i + k] & 0xC0) != 0x80) return 0;
+            cp = (cp << 6) | (s[i + k] & 0x3Fu);
+        }
+        if (len == 3 && cp < 0x800) return 0;
+        if (len == 4 && (cp < 0x10000 || cp > 0x10FFFF)) return 0;
+        if (cp >= 0xD800 && cp <= 0xDFFF) return 0;
+        i += len;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -484,11 +608,42 @@ static void safe_copy_str(char *dst, size_t dstsz, const cJSON *item) {
     }
 }
 
+/* extra from the data file: a JSON object -> compact text, anything else -> "{}".
+   Older versions accepted non-string values; they are turned into their JSON
+   text as a string, which is what Spoolman stores. */
+static void load_extra_raw(const cJSON *o, char *buf, size_t bufsz) {
+    const cJSON *extra = cJSON_GetObjectItemCaseSensitive(o, "extra");
+    cJSON *copy = cJSON_IsObject(extra) ? cJSON_Duplicate(extra, 1) : NULL;
+    for (cJSON *ch = copy ? copy->child : NULL; ch; ) {
+        cJSON *next = ch->next;
+        if (!cJSON_IsString(ch) && ch->string) {
+            char *t = cJSON_PrintUnformatted(ch);
+            cJSON *str = cJSON_CreateString(t ? t : "null");
+            free(t);
+            if (str && !cJSON_ReplaceItemInObjectCaseSensitive(copy, ch->string, str)) cJSON_Delete(str);
+        }
+        ch = next;
+    }
+    char *s = copy ? cJSON_PrintUnformatted(copy) : NULL;
+    cJSON_Delete(copy);
+    if (s && strlen(s) < bufsz) memcpy(buf, s, strlen(s) + 1);
+    else snprintf(buf, bufsz, "{}");
+    free(s);
+}
+
+/* id from the data file: an integer in 1..INT_MAX-1 (so next_id = max+1 cannot overflow). */
+static int load_id_raw(const cJSON *o, int *out) {
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "id");
+    if (!cJSON_IsNumber(id)) return -1;
+    double d = id->valuedouble;
+    if (!(d >= 1 && d < (double)INT_MAX) || d != floor(d)) return -1;
+    *out = (int)d;
+    return 0;
+}
+
 static int load_vendor_raw(const cJSON *o, Vendor *v) {
     memset(v, 0, sizeof *v);
-    cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "id");
-    if (!cJSON_IsNumber(id)) return -1;
-    v->id = id->valueint;
+    if (load_id_raw(o, &v->id) != 0) return -1;
     safe_copy_str(v->registered, sizeof v->registered, cJSON_GetObjectItemCaseSensitive(o, "registered"));
     safe_copy_str(v->name, sizeof v->name, cJSON_GetObjectItemCaseSensitive(o, "name"));
     cJSON *c = cJSON_GetObjectItemCaseSensitive(o, "comment");
@@ -497,18 +652,13 @@ static int load_vendor_raw(const cJSON *o, Vendor *v) {
     if (cJSON_IsNumber(esw)) { v->has_empty_spool_weight = 1; v->empty_spool_weight = esw->valuedouble; }
     cJSON *ext = cJSON_GetObjectItemCaseSensitive(o, "external_id");
     if (ext) { v->has_external_id = 1; safe_copy_str(v->external_id, sizeof v->external_id, ext); }
-    cJSON *extra = cJSON_GetObjectItemCaseSensitive(o, "extra");
-    char *s = cJSON_PrintUnformatted(extra ? extra : cJSON_CreateObject());
-    if (s) { strncpy(v->extra, s, sizeof v->extra - 1); free(s); }
-    else strcpy(v->extra, "{}");
+    load_extra_raw(o, v->extra, sizeof v->extra);
     return 0;
 }
 
 static int load_filament_raw(const cJSON *o, Filament *f) {
     memset(f, 0, sizeof *f);
-    cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "id");
-    if (!cJSON_IsNumber(id)) return -1;
-    f->id = id->valueint;
+    if (load_id_raw(o, &f->id) != 0) return -1;
     safe_copy_str(f->registered, sizeof f->registered, cJSON_GetObjectItemCaseSensitive(o, "registered"));
     cJSON *name = cJSON_GetObjectItemCaseSensitive(o, "name");
     if (name) { f->has_name = 1; safe_copy_str(f->name, sizeof f->name, name); }
@@ -542,18 +692,13 @@ static int load_filament_raw(const cJSON *o, Filament *f) {
     if (mcd) { f->has_multi_color_direction = 1; safe_copy_str(f->multi_color_direction, sizeof f->multi_color_direction, mcd); }
     cJSON *extid = cJSON_GetObjectItemCaseSensitive(o, "external_id");
     if (extid) { f->has_external_id = 1; safe_copy_str(f->external_id, sizeof f->external_id, extid); }
-    cJSON *extra = cJSON_GetObjectItemCaseSensitive(o, "extra");
-    char *s = cJSON_PrintUnformatted(extra ? extra : cJSON_CreateObject());
-    if (s) { strncpy(f->extra, s, sizeof f->extra - 1); free(s); }
-    else strcpy(f->extra, "{}");
+    load_extra_raw(o, f->extra, sizeof f->extra);
     return 0;
 }
 
 static int load_spool_raw(const cJSON *o, Spool *s) {
     memset(s, 0, sizeof *s);
-    cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "id");
-    if (!cJSON_IsNumber(id)) return -1;
-    s->id = id->valueint;
+    if (load_id_raw(o, &s->id) != 0) return -1;
     safe_copy_str(s->registered, sizeof s->registered, cJSON_GetObjectItemCaseSensitive(o, "registered"));
     cJSON *fu = cJSON_GetObjectItemCaseSensitive(o, "first_used");
     if (fu) { s->has_first_used = 1; safe_copy_str(s->first_used, sizeof s->first_used, fu); }
@@ -577,33 +722,86 @@ static int load_spool_raw(const cJSON *o, Spool *s) {
     if (cm) { s->has_comment = 1; safe_copy_str(s->comment, sizeof s->comment, cm); }
     cJSON *arc = cJSON_GetObjectItemCaseSensitive(o, "archived");
     s->archived = cJSON_IsTrue(arc) ? 1 : 0;
-    cJSON *extra = cJSON_GetObjectItemCaseSensitive(o, "extra");
-    char *s2 = cJSON_PrintUnformatted(extra ? extra : cJSON_CreateObject());
-    if (s2) { strncpy(s->extra, s2, sizeof s->extra - 1); free(s2); }
-    else strcpy(s->extra, "{}");
+    load_extra_raw(o, s->extra, sizeof s->extra);
     return 0;
 }
 
-/* Атомарная запись: временный файл рядом + fsync + rename. */
-static int write_file_atomic(const char *path, const char *data, size_t len) {
-    char tmp[1024];
-    int n = snprintf(tmp, sizeof tmp, "%s.tmp-%d", path, (int)getpid());
-    if (n < 0 || (size_t)n >= sizeof tmp) return -1;
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+/* fsync of the directory makes the rename itself durable. */
+static int fsync_data_dir(void) {
+    int dfd = open(g_data_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return -1;
+    int rc = fsync(dfd);
+    if (rc != 0 && (errno == EINVAL || errno == ENOTSUP)) rc = 0;   /* fs without directory fsync */
+    int e = errno;
+    close(dfd);
+    errno = e;
+    return rc;
+}
+
+/* Writes data to a new file `tmp` (O_EXCL|O_NOFOLLOW: never follows a planted
+   symlink or reuses someone else's file) and fsyncs it. */
+static int write_new_file(const char *tmp, const char *data, size_t len) {
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0 && errno == EEXIST) {
+        /* left over from a crashed process with our pid: ours to remove */
+        if (unlink(tmp) != 0) return -1;
+        fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    }
     if (fd < 0) return -1;
     size_t off = 0;
+    int e;
     while (off < len) {
         ssize_t w = write(fd, data + off, len - off);
-        if (w < 0) { if (errno == EINTR) continue; close(fd); unlink(tmp); return -1; }
+        if (w < 0) { if (errno == EINTR) continue; goto fail; }
         off += (size_t)w;
     }
-    if (fsync(fd) != 0) { close(fd); unlink(tmp); return -1; }
-    if (close(fd) != 0) { unlink(tmp); return -1; }
-    if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    if (fsync(fd) != 0) goto fail;
+    if (close(fd) != 0) { e = errno; unlink(tmp); errno = e; return -1; }
     return 0;
+fail:
+    e = errno;
+    close(fd);
+    unlink(tmp);
+    errno = e;
+    return -1;
 }
 
-static void save_data(void) {
+/* Атомарная запись: временный файл рядом + fsync + rename + fsync каталога. */
+static int write_file_atomic(const char *path, const char *data, size_t len) {
+    char tmp[1200];
+    int n = snprintf(tmp, sizeof tmp, "%s.tmp-%d", path, (int)getpid());
+    if (n < 0 || (size_t)n >= sizeof tmp) { errno = ENAMETOOLONG; return -1; }
+    if (write_new_file(tmp, data, len) != 0) return -1;
+    if (rename(tmp, path) != 0) { int e = errno; unlink(tmp); errno = e; return -1; }
+    return fsync_data_dir();
+}
+
+static char *read_file_all(const char *path, size_t *out_len);
+
+/* Before the main file is replaced, its current version becomes <datafile>.bak:
+   a hard link to the same inode, renamed over the old .bak, so the step is
+   atomic and copies nothing. Filesystems without hard links get a copy. If the
+   main file is the damaged one we did not load (g_main_damaged), it is kept as
+   <datafile>.corrupt instead and the .bak we loaded stays as it is. */
+static void keep_previous_version(void) {
+    const char *dst = g_main_damaged ? g_corrupt_path : g_bak_path;
+    char tmp[1200];
+    int n = snprintf(tmp, sizeof tmp, "%s.tmp-%d", dst, (int)getpid());
+    if (n < 0 || (size_t)n >= sizeof tmp) return;
+    unlink(tmp);
+    if (link(g_data_path, tmp) == 0) {
+        if (rename(tmp, dst) != 0) unlink(tmp);
+        return;
+    }
+    if (errno == ENOENT) return;   /* first save: nothing to keep */
+    size_t len = 0;
+    char *old = read_file_all(g_data_path, &len);
+    if (old) { write_file_atomic(dst, old, len); free(old); }
+}
+
+/* Serializes everything and writes it. 0 = on disk; -1 = failed, data stays
+   dirty and is retried in SAVE_RETRY_S. */
+static int save_data(void) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "version", 1);
     cJSON *nid = cJSON_CreateObject();
@@ -626,16 +824,50 @@ static void save_data(void) {
 
     char *text = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!text) { fprintf(stderr, "microspool: ошибка сериализации данных для сохранения\n"); return; }
-    if (write_file_atomic(g_data_path, text, strlen(text)) != 0) {
-        fprintf(stderr, "microspool: не удалось сохранить %s: %s\n", g_data_path, strerror(errno));
+    int rc = -1;
+    if (!text) {
+        errno = ENOMEM;
+    } else {
+        keep_previous_version();
+        rc = write_file_atomic(g_data_path, text, strlen(text));
+    }
+    double now = mono_now();
+    if (rc != 0) {
+        /* don't flood the log while the disk stays full */
+        if (now - g_last_fail_log >= 60) {
+            fprintf(stderr, "microspool: не удалось сохранить %s: %s (will retry)\n", g_data_path, strerror(errno));
+            g_last_fail_log = now;
+        }
+        g_dirty = 1;
+        g_save_due = now + SAVE_RETRY_S;
     } else {
         log_v("сохранено %s (%zu байт)", g_data_path, strlen(text));
+        if (g_last_fail_log > -1e9) {
+            fprintf(stderr, "microspool: saved %s again after earlier failures\n", g_data_path);
+            g_last_fail_log = -1e9;
+        }
+        g_main_damaged = 0;
+        g_dirty = 0;
     }
     free(text);
-    g_data_dirty_immediate = 0;
-    g_use_pending = 0;
-    g_last_use_flush_mono = mono_now();
+    return rc;
+}
+
+/* Deferred save (use reports): due USE_FLUSH_INTERVAL_S after the first unsaved change. */
+static void mark_dirty_deferred(void) {
+    if (!g_dirty) {
+        g_dirty = 1;
+        g_save_due = mono_now() + USE_FLUSH_INTERVAL_S;
+    }
+}
+
+/* next_id from the data file; out-of-range values fall back to 1 (the max-id
+   scan below then moves it past the existing records). */
+static int next_id_raw(const cJSON *n) {
+    if (!cJSON_IsNumber(n)) return 1;
+    double d = n->valuedouble;
+    if (!(d >= 1 && d <= (double)INT_MAX) || d != floor(d)) return 1;
+    return (int)d;
 }
 
 /* читает файл целиком; возвращает malloc'нутый буфер (с NUL) или NULL */
@@ -655,30 +887,47 @@ static char *read_file_all(const char *path, size_t *out_len) {
     return buf;
 }
 
-/* Загружает данные с диска. Возвращает 0 при успехе (в т.ч. если файла нет),
-   -1 если файл есть, но повреждён/некорректной структуры (не трогаем файл). */
-static int load_data(void) {
+static void clear_all_records(void) {
+    memset(g_vendors, 0, sizeof g_vendors);
+    memset(g_filaments, 0, sizeof g_filaments);
+    memset(g_spools, 0, sizeof g_spools);
+    g_next_vendor_id = g_next_filament_id = g_next_spool_id = 1;
+}
+
+/* Loads one data file into memory (never writes). Returns 0 = loaded,
+   1 = does not exist (ENOENT only), -1 = damaged, -2 = cannot be read
+   (permissions, I/O error: not the same as "no database"). On anything but 0
+   the records are left empty. */
+static int load_data_inner(const char *path);
+static int load_data_file(const char *path) {
+    int rc = load_data_inner(path);
+    if (rc != 0) clear_all_records();
+    return rc;
+}
+
+static int load_data_inner(const char *path) {
     struct stat st;
-    if (stat(g_data_path, &st) != 0) {
-        log_v("файл данных %s не найден, стартуем с пустой базой", g_data_path);
-        return 0;
+    if (stat(path, &st) != 0) {
+        if (errno == ENOENT) return 1;
+        fprintf(stderr, "microspool: cannot access %s: %s\n", path, strerror(errno));
+        return -2;
     }
     size_t len = 0;
-    char *text = read_file_all(g_data_path, &len);
+    char *text = read_file_all(path, &len);
     if (!text) {
-        fprintf(stderr, "microspool: не удалось прочитать %s: %s\n", g_data_path, strerror(errno));
-        return -1;
+        fprintf(stderr, "microspool: не удалось прочитать %s: %s\n", path, strerror(errno));
+        return -2;
     }
     cJSON *root = cJSON_Parse(text);
     free(text);
     if (!root || !cJSON_IsObject(root)) {
-        fprintf(stderr, "microspool: файл данных %s повреждён (невалидный JSON)\n", g_data_path);
+        fprintf(stderr, "microspool: файл данных %s повреждён (невалидный JSON)\n", path);
         if (root) cJSON_Delete(root);
         return -1;
     }
     cJSON *ver = cJSON_GetObjectItemCaseSensitive(root, "version");
     if (!cJSON_IsNumber(ver) || ver->valueint != 1) {
-        fprintf(stderr, "microspool: файл данных %s имеет неизвестную версию формата\n", g_data_path);
+        fprintf(stderr, "microspool: файл данных %s имеет неизвестную версию формата\n", path);
         cJSON_Delete(root);
         return -1;
     }
@@ -687,13 +936,11 @@ static int load_data(void) {
     cJSON *fs = cJSON_GetObjectItemCaseSensitive(root, "filaments");
     cJSON *sp = cJSON_GetObjectItemCaseSensitive(root, "spools");
     if (!cJSON_IsObject(nid) || !cJSON_IsArray(vs) || !cJSON_IsArray(fs) || !cJSON_IsArray(sp)) {
-        fprintf(stderr, "microspool: файл данных %s повреждён (нет ожидаемых полей)\n", g_data_path);
+        fprintf(stderr, "microspool: файл данных %s повреждён (нет ожидаемых полей)\n", path);
         cJSON_Delete(root);
         return -1;
     }
-    memset(g_vendors, 0, sizeof g_vendors);
-    memset(g_filaments, 0, sizeof g_filaments);
-    memset(g_spools, 0, sizeof g_spools);
+    clear_all_records();
 
     int i = 0;
     cJSON *item;
@@ -718,17 +965,78 @@ static int load_data(void) {
     cJSON *nv = cJSON_GetObjectItemCaseSensitive(nid, "vendor");
     cJSON *nf = cJSON_GetObjectItemCaseSensitive(nid, "filament");
     cJSON *ns = cJSON_GetObjectItemCaseSensitive(nid, "spool");
-    g_next_vendor_id = cJSON_IsNumber(nv) ? nv->valueint : 1;
-    g_next_filament_id = cJSON_IsNumber(nf) ? nf->valueint : 1;
-    g_next_spool_id = cJSON_IsNumber(ns) ? ns->valueint : 1;
+    /* duplicate ids would make find/patch/delete hit only the first record */
+    for (int a = 0; a < MAX_VENDORS; a++) for (int b = a + 1; b < MAX_VENDORS && g_vendors[a].id; b++)
+        if (g_vendors[a].id == g_vendors[b].id) { fprintf(stderr, "microspool: duplicate vendor id %d in the data file\n", g_vendors[a].id); cJSON_Delete(root); return -1; }
+    for (int a = 0; a < MAX_FILAMENTS; a++) for (int b = a + 1; b < MAX_FILAMENTS && g_filaments[a].id; b++)
+        if (g_filaments[a].id == g_filaments[b].id) { fprintf(stderr, "microspool: duplicate filament id %d in the data file\n", g_filaments[a].id); cJSON_Delete(root); return -1; }
+    for (int a = 0; a < MAX_SPOOLS; a++) for (int b = a + 1; b < MAX_SPOOLS && g_spools[a].id; b++)
+        if (g_spools[a].id == g_spools[b].id) { fprintf(stderr, "microspool: duplicate spool id %d in the data file\n", g_spools[a].id); cJSON_Delete(root); return -1; }
+
+    g_next_vendor_id = next_id_raw(nv);
+    g_next_filament_id = next_id_raw(nf);
+    g_next_spool_id = next_id_raw(ns);
     /* защита от рассинхронизации: next_id не должен быть <= максимального id */
     for (int k = 0; k < MAX_VENDORS; k++) if (g_vendors[k].id >= g_next_vendor_id) g_next_vendor_id = g_vendors[k].id + 1;
     for (int k = 0; k < MAX_FILAMENTS; k++) if (g_filaments[k].id >= g_next_filament_id) g_next_filament_id = g_filaments[k].id + 1;
     for (int k = 0; k < MAX_SPOOLS; k++) if (g_spools[k].id >= g_next_spool_id) g_next_spool_id = g_spools[k].id + 1;
 
     cJSON_Delete(root);
-    log_v("загружено %s", g_data_path);
+    log_v("загружено %s", path);
     return 0;
+}
+
+/* Startup load: the main file, or <datafile>.bak if the main file is damaged.
+   If both are bad, refuse to start and change neither file. */
+static int load_data(void) {
+    int rc = load_data_file(g_data_path);
+    if (rc == 0) return 0;
+    if (rc == 1) {
+        log_v("файл данных %s не найден, стартуем с пустой базой", g_data_path);
+        return 0;
+    }
+    if (rc == -2) return -1;
+    fprintf(stderr,
+        "microspool: ********************************************************\n"
+        "microspool: WARNING: data file %s is damaged, trying the backup %s\n", g_data_path, g_bak_path);
+    int brc = load_data_file(g_bak_path);
+    if (brc == 0) {
+        fprintf(stderr,
+            "microspool: WARNING: loaded the previous version from %s.\n"
+            "microspool: WARNING: changes made after it was written are lost.\n"
+            "microspool: WARNING: the damaged file will be kept as %s.\n"
+            "microspool: ********************************************************\n",
+            g_bak_path, g_corrupt_path);
+        g_main_damaged = 1;
+        g_dirty = 1;            /* repair the main file right away */
+        g_save_due = 0;
+        return 0;
+    }
+    fprintf(stderr, "microspool: backup %s is %s; refusing to start, neither file was changed\n",
+            g_bak_path, brc == 1 ? "missing" : "unusable too");
+    return -1;
+}
+
+/* Removes <datafile>.tmp-*, .bak.tmp-* and .corrupt.tmp-* left by a crash. */
+static void remove_stale_temp_files(void) {
+    const char *slash = strrchr(g_data_path, '/');
+    const char *base = slash ? slash + 1 : g_data_path;
+    char p1[300], p2[300], p3[300];
+    snprintf(p1, sizeof p1, "%s.tmp-", base);
+    snprintf(p2, sizeof p2, "%s.bak.tmp-", base);
+    snprintf(p3, sizeof p3, "%s.corrupt.tmp-", base);
+    DIR *d = opendir(g_data_dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, p1, strlen(p1)) != 0 && strncmp(de->d_name, p2, strlen(p2)) != 0 &&
+            strncmp(de->d_name, p3, strlen(p3)) != 0) continue;
+        char full[1400];
+        int n = snprintf(full, sizeof full, "%s/%s", g_data_dir, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof full) continue;
+        if (unlink(full) == 0) log_v("removed stale temporary file %s", full);
+    }
+    closedir(d);
 }
 
 /* Рассылка события всем WebSocket-клиентам; определена в сетевой секции ниже,
@@ -775,7 +1083,8 @@ static double weight_to_length_mm(double weight_g, double density, double diamet
     double r = diameter_mm / 2.0;
     double denom = density * M_PI * r * r / 1000.0;
     if (denom <= 0) return 0;
-    return weight_g / denom;
+    double len = weight_g / denom;
+    return isfinite(len) ? len : 0;   /* cJSON would print inf as null */
 }
 
 static cJSON *spool_response_json(const Spool *s) {
@@ -825,6 +1134,22 @@ static cJSON *spool_response_json(const Spool *s) {
 /* ошибки (400/404/...), msg заполнен человекочитаемым текстом.            */
 /* ------------------------------------------------------------------------ */
 
+/* Spoolman list parameters we support: limit/offset (X-Total-Count stays the
+   number of matches before paging) and, for filaments, vendor.id. */
+#define MAX_ID_FILTER 16
+typedef struct {
+    long limit;                     /* -1 = no limit */
+    long offset;
+    int  n_vendor_ids;              /* 0 = no vendor filter */
+    int  vendor_ids[MAX_ID_FILTER]; /* -1 = "no vendor", as in Spoolman */
+} ListQuery;
+
+static void page_range(int n, const ListQuery *q, int *from, int *to) {
+    long f = q->offset < n ? q->offset : n;
+    long t = (q->limit < 0 || q->limit > n - f) ? n : f + q->limit;
+    *from = (int)f; *to = (int)t;
+}
+
 #define VENDOR_ACTIVE_COUNT(n) do { n = 0; for (int _i = 0; _i < MAX_VENDORS; _i++) if (g_vendors[_i].id) n++; } while (0)
 #define FILAMENT_ACTIVE_COUNT(n) do { n = 0; for (int _i = 0; _i < MAX_FILAMENTS; _i++) if (g_filaments[_i].id) n++; } while (0)
 #define SPOOL_ACTIVE_COUNT(n) do { n = 0; for (int _i = 0; _i < MAX_SPOOLS; _i++) if (g_spools[_i].id) n++; } while (0)
@@ -860,7 +1185,7 @@ static int vendor_apply_fields(const cJSON *input, Vendor *v, int is_create, cha
 
     char ebuf[EXTRA_CAP];
     rc = jget_extra(input, ebuf, sizeof ebuf, &present, &has);
-    if (rc != 0) { snprintf(msg, msgsz, "extra must be a JSON object (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
+    if (rc != 0) { snprintf(msg, msgsz, "extra must be an object with string values (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
     if (present) strcpy(v->extra, has ? ebuf : "{}");
     else if (is_create) strcpy(v->extra, "{}");
     return 0;
@@ -873,6 +1198,8 @@ static int vendor_create(const cJSON *input, cJSON **body_out, char *msg, size_t
     if (!slot) { snprintf(msg, msgsz, "vendor limit reached (%d)", MAX_VENDORS); return 400; }
     Vendor tmp; memset(&tmp, 0, sizeof tmp);
     if (vendor_apply_fields(input, &tmp, 1, msg, msgsz) != 0) return 400;
+    if (g_next_vendor_id >= INT_MAX) { snprintf(msg, msgsz, "vendor ids exhausted"); return 400; }
+    UNDO_OR_FAIL(slot);
     tmp.id = g_next_vendor_id++;
     now_iso(tmp.registered, sizeof tmp.registered);
     *slot = tmp;
@@ -887,12 +1214,13 @@ static int vendor_get(int id, cJSON **body_out, char *msg, size_t msgsz) {
     return 0;
 }
 
-static int vendor_list(cJSON **body_out, int *count) {
-    int ids[MAX_VENDORS], n = 0;
+static int vendor_list(const ListQuery *q, cJSON **body_out, int *count) {
+    int ids[MAX_VENDORS], n = 0, from, to;
     for (int i = 0; i < MAX_VENDORS; i++) if (g_vendors[i].id) ids[n++] = g_vendors[i].id;
     qsort(ids, n, sizeof(int), cmp_int);
     cJSON *arr = cJSON_CreateArray();
-    for (int i = 0; i < n; i++) cJSON_AddItemToArray(arr, vendor_json(vendor_find(ids[i])));
+    page_range(n, q, &from, &to);
+    for (int i = from; i < to; i++) cJSON_AddItemToArray(arr, vendor_json(vendor_find(ids[i])));
     *body_out = arr;
     *count = n;
     return 0;
@@ -903,6 +1231,7 @@ static int vendor_patch(int id, const cJSON *input, cJSON **body_out, char *msg,
     if (!v) { snprintf(msg, msgsz, "vendor %d not found", id); return 404; }
     Vendor tmp = *v;
     if (vendor_apply_fields(input, &tmp, 0, msg, msgsz) != 0) return 400;
+    UNDO_OR_FAIL(v);
     *v = tmp;
     *body_out = vendor_json(v);
     return 0;
@@ -911,6 +1240,10 @@ static int vendor_patch(int id, const cJSON *input, cJSON **body_out, char *msg,
 static int vendor_delete(int id, cJSON **body_out, char *msg, size_t msgsz) {
     Vendor *v = vendor_find(id);
     if (!v) { snprintf(msg, msgsz, "vendor %d not found", id); return 404; }
+    for (int i = 0; i < MAX_FILAMENTS; i++)
+        if (g_filaments[i].id && g_filaments[i].has_vendor_id && g_filaments[i].vendor_id == id)
+            UNDO_OR_FAIL(&g_filaments[i]);
+    UNDO_OR_FAIL(v);
     cJSON *deleted = vendor_json(v);
     for (int i = 0; i < MAX_FILAMENTS; i++) {
         if (g_filaments[i].id && g_filaments[i].has_vendor_id && g_filaments[i].vendor_id == id) {
@@ -1030,7 +1363,7 @@ static int filament_apply_fields(const cJSON *input, Filament *f, int is_create,
 
     char ebuf[EXTRA_CAP];
     rc = jget_extra(input, ebuf, sizeof ebuf, &present, &has);
-    if (rc != 0) { snprintf(msg, msgsz, "extra must be a JSON object (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
+    if (rc != 0) { snprintf(msg, msgsz, "extra must be an object with string values (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
     if (present) strcpy(f->extra, has ? ebuf : "{}");
     else if (is_create) strcpy(f->extra, "{}");
     return 0;
@@ -1043,6 +1376,8 @@ static int filament_create(const cJSON *input, cJSON **body_out, char *msg, size
     if (!slot) { snprintf(msg, msgsz, "filament limit reached (%d)", MAX_FILAMENTS); return 400; }
     Filament tmp; memset(&tmp, 0, sizeof tmp);
     if (filament_apply_fields(input, &tmp, 1, msg, msgsz) != 0) return 400;
+    if (g_next_filament_id >= INT_MAX) { snprintf(msg, msgsz, "filament ids exhausted"); return 400; }
+    UNDO_OR_FAIL(slot);
     tmp.id = g_next_filament_id++;
     now_iso(tmp.registered, sizeof tmp.registered);
     *slot = tmp;
@@ -1057,12 +1392,23 @@ static int filament_get(int id, cJSON **body_out, char *msg, size_t msgsz) {
     return 0;
 }
 
-static int filament_list(cJSON **body_out, int *count) {
-    int ids[MAX_FILAMENTS], n = 0;
-    for (int i = 0; i < MAX_FILAMENTS; i++) if (g_filaments[i].id) ids[n++] = g_filaments[i].id;
+static int filament_matches(const Filament *f, const ListQuery *q) {
+    if (q->n_vendor_ids == 0) return 1;
+    for (int k = 0; k < q->n_vendor_ids; k++) {
+        if (q->vendor_ids[k] == -1 && !f->has_vendor_id) return 1;
+        if (f->has_vendor_id && f->vendor_id == q->vendor_ids[k]) return 1;
+    }
+    return 0;
+}
+
+static int filament_list(const ListQuery *q, cJSON **body_out, int *count) {
+    int ids[MAX_FILAMENTS], n = 0, from, to;
+    for (int i = 0; i < MAX_FILAMENTS; i++)
+        if (g_filaments[i].id && filament_matches(&g_filaments[i], q)) ids[n++] = g_filaments[i].id;
     qsort(ids, n, sizeof(int), cmp_int);
     cJSON *arr = cJSON_CreateArray();
-    for (int i = 0; i < n; i++) cJSON_AddItemToArray(arr, filament_response_json(filament_find(ids[i])));
+    page_range(n, q, &from, &to);
+    for (int i = from; i < to; i++) cJSON_AddItemToArray(arr, filament_response_json(filament_find(ids[i])));
     *body_out = arr;
     *count = n;
     return 0;
@@ -1073,6 +1419,7 @@ static int filament_patch(int id, const cJSON *input, cJSON **body_out, char *ms
     if (!f) { snprintf(msg, msgsz, "filament %d not found", id); return 404; }
     Filament tmp = *f;
     if (filament_apply_fields(input, &tmp, 0, msg, msgsz) != 0) return 400;
+    UNDO_OR_FAIL(f);
     *f = tmp;
     *body_out = filament_response_json(f);
     return 0;
@@ -1087,6 +1434,7 @@ static int filament_delete(int id, cJSON **body_out, char *msg, size_t msgsz) {
             return 400;
         }
     }
+    UNDO_OR_FAIL(f);
     cJSON *deleted = filament_response_json(f);
     memset(f, 0, sizeof *f);
     *body_out = deleted;
@@ -1188,7 +1536,7 @@ static int spool_apply_fields(const cJSON *input, Spool *s, int is_create, char 
 
     char ebuf[EXTRA_CAP];
     rc = jget_extra(input, ebuf, sizeof ebuf, &present, &has);
-    if (rc != 0) { snprintf(msg, msgsz, "extra must be a JSON object (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
+    if (rc != 0) { snprintf(msg, msgsz, "extra must be an object with string values (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
     if (present) strcpy(s->extra, has ? ebuf : "{}");
     else if (is_create) strcpy(s->extra, "{}");
 
@@ -1204,6 +1552,8 @@ static int spool_create(const cJSON *input, cJSON **body_out, char *msg, size_t 
     Spool tmp; memset(&tmp, 0, sizeof tmp);
     strcpy(tmp.extra, "{}");
     if (spool_apply_fields(input, &tmp, 1, msg, msgsz) != 0) return 400;
+    if (g_next_spool_id >= INT_MAX) { snprintf(msg, msgsz, "spool ids exhausted"); return 400; }
+    UNDO_OR_FAIL(slot);
     tmp.id = g_next_spool_id++;
     now_iso(tmp.registered, sizeof tmp.registered);
     *slot = tmp;
@@ -1218,8 +1568,8 @@ static int spool_get(int id, cJSON **body_out, char *msg, size_t msgsz) {
     return 0;
 }
 
-static int spool_list(int allow_archived, cJSON **body_out, int *count) {
-    int ids[MAX_SPOOLS], n = 0;
+static int spool_list(int allow_archived, const ListQuery *q, cJSON **body_out, int *count) {
+    int ids[MAX_SPOOLS], n = 0, from, to;
     for (int i = 0; i < MAX_SPOOLS; i++) {
         if (!g_spools[i].id) continue;
         if (g_spools[i].archived && !allow_archived) continue;
@@ -1227,7 +1577,8 @@ static int spool_list(int allow_archived, cJSON **body_out, int *count) {
     }
     qsort(ids, n, sizeof(int), cmp_int);
     cJSON *arr = cJSON_CreateArray();
-    for (int i = 0; i < n; i++) cJSON_AddItemToArray(arr, spool_response_json(spool_find(ids[i])));
+    page_range(n, q, &from, &to);
+    for (int i = from; i < to; i++) cJSON_AddItemToArray(arr, spool_response_json(spool_find(ids[i])));
     *body_out = arr;
     *count = n;
     return 0;
@@ -1238,6 +1589,7 @@ static int spool_patch(int id, const cJSON *input, cJSON **body_out, char *msg, 
     if (!s) { snprintf(msg, msgsz, "spool %d not found", id); return 404; }
     Spool tmp = *s;
     if (spool_apply_fields(input, &tmp, 0, msg, msgsz) != 0) return 400;
+    UNDO_OR_FAIL(s);
     *s = tmp;
     *body_out = spool_response_json(s);
     return 0;
@@ -1246,6 +1598,7 @@ static int spool_patch(int id, const cJSON *input, cJSON **body_out, char *msg, 
 static int spool_delete(int id, cJSON **body_out, char *msg, size_t msgsz) {
     Spool *s = spool_find(id);
     if (!s) { snprintf(msg, msgsz, "spool %d not found", id); return 404; }
+    UNDO_OR_FAIL(s);
     cJSON *deleted = spool_response_json(s);
     memset(s, 0, sizeof *s);
     *body_out = deleted;
@@ -1277,6 +1630,7 @@ static int spool_use(int id, const cJSON *input, cJSON **body_out, char *msg, si
         double denom = density * M_PI * r * r / 1000.0; /* г на мм длины */
         delta = use_length * denom;
     }
+    if (!isfinite(s->used_weight + delta)) { snprintf(msg, msgsz, "use out of range"); return 400; }
     s->used_weight += delta;
     char ts[32];
     now_iso(ts, sizeof ts);
@@ -1339,6 +1693,9 @@ typedef struct {
     int  is_ws_upgrade;
     char ws_key[192];
     int  accepts_gzip;    /* Accept-Encoding содержит "gzip" (для GET /, /index.html) */
+    int  has_host;     char host[256];
+    int  has_origin;   char origin[256];
+    char content_type[128];
 } HttpRequestMeta;
 
 static const char *find_header_end(const char *buf, size_t len) {
@@ -1395,6 +1752,16 @@ static int parse_http_request_line_and_headers(const char *buf, size_t hdr_len, 
             if (ci_contains(val, "gzip")) m->accepts_gzip = 1;
         } else if (str_ieq(key, "Sec-WebSocket-Key")) {
             strncpy(m->ws_key, val, sizeof m->ws_key - 1);
+        } else if (str_ieq(key, "Host")) {
+            if (m->has_host || strlen(val) >= sizeof m->host) return -1;   /* duplicate or oversized */
+            m->has_host = 1;
+            memcpy(m->host, val, strlen(val) + 1);
+        } else if (str_ieq(key, "Origin")) {
+            if (m->has_origin || strlen(val) >= sizeof m->origin) return -1;
+            m->has_origin = 1;
+            memcpy(m->origin, val, strlen(val) + 1);
+        } else if (str_ieq(key, "Content-Type")) {
+            strncpy(m->content_type, val, sizeof m->content_type - 1);
         }
     }
     m->is_ws_upgrade = upgrade_hdr;
@@ -1407,6 +1774,60 @@ static void split_path(const char *raw, char *out_path, size_t out_sz) {
     if (len >= out_sz) len = out_sz - 1;
     memcpy(out_path, raw, len);
     out_path[len] = 0;
+}
+
+/* Raw value of `key` in the query string (no percent-decoding; only used for
+   numbers). Returns 1 if present. */
+static int query_param(const char *raw, const char *key, char *out, size_t outsz) {
+    const char *q = strchr(raw, '?');
+    if (!q) return 0;
+    size_t klen = strlen(key);
+    for (q++; *q; ) {
+        size_t seglen = strcspn(q, "&");
+        if (seglen > klen && q[klen] == '=' && strncmp(q, key, klen) == 0) {
+            size_t vlen = seglen - klen - 1;
+            if (vlen >= outsz) vlen = outsz - 1;
+            memcpy(out, q + klen + 1, vlen);
+            out[vlen] = 0;
+            return 1;
+        }
+        q += seglen;
+        if (*q == '&') q++;
+    }
+    return 0;
+}
+
+static int parse_long_param(const char *v, long min, long max, long *out) {
+    char *end;
+    errno = 0;
+    long x = strtol(v, &end, 10);
+    if (!*v || *end || errno || x < min || x > max) return -1;
+    *out = x;
+    return 0;
+}
+
+/* limit, offset and vendor.id (vendor_id is the older Spoolman name). 0 = ok. */
+static int parse_list_query(const char *raw, ListQuery *q, char *msg, size_t msgsz) {
+    memset(q, 0, sizeof *q);
+    q->limit = -1;
+    char v[128];
+    if (query_param(raw, "limit", v, sizeof v) && parse_long_param(v, 0, INT_MAX, &q->limit) != 0) {
+        snprintf(msg, msgsz, "limit must be a non-negative integer"); return -1;
+    }
+    if (query_param(raw, "offset", v, sizeof v) && parse_long_param(v, 0, INT_MAX, &q->offset) != 0) {
+        snprintf(msg, msgsz, "offset must be a non-negative integer"); return -1;
+    }
+    if (query_param(raw, "vendor.id", v, sizeof v) || query_param(raw, "vendor_id", v, sizeof v)) {
+        char *save = NULL;
+        for (char *tok = strtok_r(v, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            long id;
+            if (q->n_vendor_ids >= MAX_ID_FILTER || parse_long_param(tok, -1, INT_MAX, &id) != 0) {
+                snprintf(msg, msgsz, "vendor.id must be a comma-separated list of ids"); return -1;
+            }
+            q->vendor_ids[q->n_vendor_ids++] = (int)id;
+        }
+    }
+    return 0;
 }
 
 static int query_allow_archived(const char *raw_path_with_query) {
@@ -1432,12 +1853,20 @@ static int query_allow_archived(const char *raw_path_with_query) {
 /* Соединения: состояние, буферы, ввод-вывод                                */
 /* ------------------------------------------------------------------------ */
 
-typedef enum { CS_HTTP_HEADERS, CS_HTTP_BODY, CS_HTTP_CLOSING, CS_WS } conn_state_t;
+/* CS_HTTP_HELD: complete LAN write request waiting for a save token (see g_save_tokens). */
+typedef enum { CS_HTTP_HEADERS, CS_HTTP_BODY, CS_HTTP_HELD, CS_HTTP_CLOSING, CS_WS } conn_state_t;
 
 typedef struct {
     int fd;
     int in_use;
     conn_state_t state;
+
+    /* Who is on the other end. "Local" = 127.0.0.1 or the machine's own address
+       (Moonraker, HelixScreen, scripts on the printer); everything else counts as
+       a LAN client and is subject to the per-peer and pool limits below. */
+    int is_local;
+    struct in_addr peer;
+    double accepted_mono;     /* the HTTP deadline counts from here, not from the last byte */
 
     char *rx; size_t rx_len, rx_cap;
     size_t header_body_offset;
@@ -1446,11 +1875,14 @@ typedef struct {
 
     char *tx; size_t tx_len, tx_cap, tx_sent;
     int close_after_flush;
-
-    double last_activity_mono;
+    int close_now;            /* drop without flushing (buffer cap hit, protocol error) */
+    int rd_eof;               /* peer shut down its sending side; stop polling POLLIN */
 
     int is_ws;
+    char ws_resource[12];     /* subscribed resource ("" = all, else vendor/filament/spool) */
+    int ws_id;                /* subscribed record id, 0 = all records of the resource */
     double last_ping_sent_mono;
+    double last_rx_mono;      /* last byte from a websocket peer (pong, ping, anything) */
     int ws_state; /* 0=заголовок кадра, 1=payload управляющего кадра, 2=съедаем данные */
     unsigned char ws_hdrbuf[14];
     int ws_hdrlen;
@@ -1463,24 +1895,30 @@ typedef struct {
 } Conn;
 
 static Conn g_conns[MAX_CONNS];
+/* Bumped on every accept into a slot: poll results gathered before an eviction
+   must not be applied to the new connection in that slot (fd numbers are reused). */
+static unsigned g_conn_gen[MAX_CONNS];
 
-/* Слот соединения переиспользуется многократно (см. MAX_CONNS). Буферы rx/tx
-   НЕ освобождаются при закрытии соединения — только их длины сбрасываются в 0,
-   а выделенная ёмкость остаётся для следующего клиента на этом слоте. Это
-   убирает churn malloc/free на потоке коротких HTTP-запросов (иначе на
-   встраиваемом musl-аллокаторе/macOS-аллокаторе RSS заметно растёт от
-   фрагментации, хотя утечки как таковой нет). Верхняя граница памяти всё
-   равно ограничена: MAX_CONNS слотов × (HEADER_LIMIT+BODY_LIMIT) в худшем
-   случае. */
-static void conn_reset(Conn *c) {
-    if (c->fd >= 0) close(c->fd);
+/* Слот соединения переиспользуется многократно (см. MAX_CONNS). Small rx/tx
+   buffers (up to BUF_KEEP_CAP) stay with the slot for the next client, which
+   avoids malloc/free churn on a stream of short HTTP requests (otherwise RSS
+   creeps up from fragmentation on small allocators). Anything bigger, e.g. after
+   a large spool list or a websocket burst, is freed, so idle memory stays at
+   MAX_CONNS × 2 × BUF_KEEP_CAP at most. */
+static void conn_clear_keep_buffers(Conn *c) {
+    if (c->rx_cap > BUF_KEEP_CAP) { free(c->rx); c->rx = NULL; c->rx_cap = 0; }
+    if (c->tx_cap > BUF_KEEP_CAP) { free(c->tx); c->tx = NULL; c->tx_cap = 0; }
     char *saved_rx = c->rx; size_t saved_rx_cap = c->rx_cap;
     char *saved_tx = c->tx; size_t saved_tx_cap = c->tx_cap;
     memset(c, 0, sizeof *c);
     c->fd = -1;
-    c->in_use = 0;
     c->rx = saved_rx; c->rx_cap = saved_rx_cap;
     c->tx = saved_tx; c->tx_cap = saved_tx_cap;
+}
+
+static void conn_reset(Conn *c) {
+    if (c->fd >= 0) close(c->fd);
+    conn_clear_keep_buffers(c);
 }
 
 static int conn_rx_reserve(Conn *c, size_t extra) {
@@ -1493,11 +1931,35 @@ static int conn_rx_reserve(Conn *c, size_t extra) {
     return 0;
 }
 
+/* Memory held by all send buffers except `except`'s. */
+static size_t tx_total_cap(const Conn *except) {
+    size_t total = 0;
+    for (int i = 0; i < MAX_CONNS; i++) if (&g_conns[i] != except) total += g_conns[i].tx_cap;
+    return total;
+}
+
+/* Queues bytes for sending. Fails (-1) instead of growing past the caps: a
+   websocket peer may have at most WS_TX_LIMIT unsent bytes queued (a client that
+   never reads cannot grow our memory via ping echoes or broadcasts), and all
+   send buffers together stay under TX_TOTAL_LIMIT. Callers drop the connection
+   or answer 503 on failure. */
 static int conn_tx_append(Conn *c, const void *data, size_t len) {
     if (len == 0) return 0;
+    size_t pending = c->tx_len - c->tx_sent;
+    size_t limit = c->is_ws ? WS_TX_LIMIT : TX_TOTAL_LIMIT;
+    if (len > limit || pending > limit - len) return -1;
+    if (c->tx_len + len > c->tx_cap && c->tx_sent > 0) {
+        /* reclaim the already-sent head before growing */
+        memmove(c->tx, c->tx + c->tx_sent, pending);
+        c->tx_len = pending;
+        c->tx_sent = 0;
+    }
     if (c->tx_len + len > c->tx_cap) {
+        size_t need = c->tx_len + len;
         size_t newcap = c->tx_cap ? c->tx_cap * 2 : 1024;
-        while (newcap < c->tx_len + len) newcap *= 2;
+        if (newcap < need) newcap = (need + 1023) & ~(size_t)1023;
+        if (newcap > TX_TOTAL_LIMIT) newcap = need;
+        if (tx_total_cap(c) + newcap > TX_TOTAL_LIMIT) return -1;
         char *n = realloc(c->tx, newcap);
         if (!n) return -1;
         c->tx = n; c->tx_cap = newcap;
@@ -1508,6 +1970,8 @@ static int conn_tx_append(Conn *c, const void *data, size_t len) {
 }
 
 static void conn_try_flush(Conn *c) {
+    if (!c->in_use) return;
+    if (c->close_now) { conn_reset(c); return; }
     while (c->tx_sent < c->tx_len) {
         ssize_t w = send(c->fd, c->tx + c->tx_sent, c->tx_len - c->tx_sent, 0);
         if (w > 0) { c->tx_sent += (size_t)w; continue; }
@@ -1517,8 +1981,9 @@ static void conn_try_flush(Conn *c) {
         return;
     }
     c->tx_len = 0; c->tx_sent = 0;
+    if (c->tx_cap > BUF_KEEP_CAP) { free(c->tx); c->tx = NULL; c->tx_cap = 0; }
     /* Ответ отправлен целиком. Мы всегда шлём `Connection: close`, поэтому закрываем сами, не дожидаясь
-       FIN от клиента: иначе слот держится до idle-таймаута (10 с) и на восьми подряд запросах сервер
+       FIN от клиента: иначе слот держится до таймаута, и на серии подряд идущих запросов сервер
        начинает отвергать новые соединения (ловилось в CI на Linux). */
     if (c->close_after_flush || c->state == CS_HTTP_CLOSING) { conn_reset(c); return; }
 }
@@ -1535,30 +2000,48 @@ static const char *status_text_for(int code) {
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 411: return "Length Required";
+        case 403: return "Forbidden";
         case 413: return "Payload Too Large";
+        case 415: return "Unsupported Media Type";
+        case 500: return "Internal Server Error";
+        case 503: return "Service Unavailable";
         default:  return "Error";
     }
+}
+
+/* Queues one complete HTTP response (the send buffer is empty at this point).
+   If it does not fit under TX_TOTAL_LIMIT the client gets a short 503 instead,
+   and if even that does not fit, the connection is dropped. */
+static void http_queue_response(Conn *c, const char *head, size_t hn, const void *body, size_t blen) {
+    c->close_after_flush = 1;
+    if (conn_tx_append(c, head, hn) == 0 && conn_tx_append(c, body, blen) == 0) return;
+    c->tx_len = 0; c->tx_sent = 0;
+    static const char busy_body[] = "{\"message\":\"server busy, try again\"}";
+    char busy[256];
+    int n = snprintf(busy, sizeof busy,
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n"
+        "Connection: close\r\n\r\n%s", sizeof busy_body - 1, busy_body);
+    if (n < 0 || (size_t)n >= sizeof busy || conn_tx_append(c, busy, (size_t)n) != 0) c->close_now = 1;
 }
 
 static void http_send_json(Conn *c, int status, cJSON *body_owned, int total_count) {
     char *json_text = body_owned ? cJSON_PrintUnformatted(body_owned) : NULL;
     if (body_owned) cJSON_Delete(body_owned);
+    if (body_owned && !json_text) status = 503;   /* out of memory while printing */
     size_t blen = json_text ? strlen(json_text) : 0;
     char head[512];
     int hn;
     if (total_count >= 0) {
         hn = snprintf(head, sizeof head,
-            "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nX-Total-Count: %d\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nContent-Length: %zu\r\nX-Total-Count: %d\r\nConnection: close\r\n\r\n",
             status, status_text_for(status), blen, total_count);
     } else {
         hn = snprintf(head, sizeof head,
-            "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
             status, status_text_for(status), blen);
     }
-    conn_tx_append(c, head, (size_t)hn);
-    if (blen) conn_tx_append(c, json_text, blen);
+    http_queue_response(c, head, (size_t)hn, json_text, blen);
     free(json_text);
-    c->close_after_flush = 1;
 }
 
 static void http_send_error(Conn *c, int status, const char *msg) {
@@ -1571,7 +2054,9 @@ static void http_send_error(Conn *c, int status, const char *msg) {
 /* WebSocket: handshake, кадры, рассылка событий                            */
 /* ------------------------------------------------------------------------ */
 
-static void ws_send_frame(Conn *c, int opcode, const unsigned char *payload, size_t len) {
+/* Queues one frame; a peer whose unsent backlog would pass WS_TX_LIMIT is
+   marked for dropping (close_now) rather than buffered without bound. */
+static int ws_send_frame(Conn *c, int opcode, const unsigned char *payload, size_t len) {
     unsigned char hdr[10];
     size_t hn = 0;
     hdr[hn++] = (unsigned char)(0x80 | (opcode & 0x0F));
@@ -1583,10 +2068,15 @@ static void ws_send_frame(Conn *c, int opcode, const unsigned char *payload, siz
         hdr[hn++] = (unsigned char)(len);
     } else {
         hdr[hn++] = 127;
-        for (int i = 7; i >= 0; i--) hdr[hn++] = (unsigned char)(len >> (8 * i));
+        /* uint64_t: with a 32-bit size_t (MIPS32, ARMv7) shifting by 32..56 bits is undefined */
+        for (int i = 7; i >= 0; i--) hdr[hn++] = (unsigned char)((uint64_t)len >> (8 * i));
     }
-    conn_tx_append(c, hdr, hn);
-    if (len) conn_tx_append(c, payload, len);
+    if (len > WS_TX_LIMIT || conn_tx_append(c, hdr, hn) != 0 || conn_tx_append(c, payload, len) != 0) {
+        log_v("websocket peer too slow (%zu bytes unsent), dropping it", c->tx_len - c->tx_sent);
+        c->close_now = 1;
+        return -1;
+    }
+    return 0;
 }
 
 static void ws_send_handshake(Conn *c, const char *key) {
@@ -1596,12 +2086,12 @@ static void ws_send_handshake(Conn *c, const char *key) {
     int n = snprintf(head, sizeof head,
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
         accept);
-    conn_tx_append(c, head, (size_t)n);
     c->is_ws = 1;
     c->state = CS_WS;
     c->close_after_flush = 0;
+    if (n < 0 || (size_t)n >= sizeof head || conn_tx_append(c, head, (size_t)n) != 0) c->close_now = 1;
     c->last_ping_sent_mono = mono_now();
-    c->last_activity_mono = mono_now();
+    c->last_rx_mono = mono_now();
     c->ws_hdrlen = 0;
     c->ws_state = 0;
 }
@@ -1619,6 +2109,7 @@ static void ws_handle_ctrl_frame(Conn *c) {
 static void ws_feed(Conn *c, const unsigned char *data, size_t n) {
     size_t i = 0;
     while (i < n) {
+        if (c->close_now || c->close_after_flush) return;   /* closing: ignore the rest */
         if (c->ws_state == 0) {
             if (c->ws_hdrlen < 2) {
                 c->ws_hdrbuf[c->ws_hdrlen++] = data[i++];
@@ -1692,6 +2183,8 @@ static void ws_feed(Conn *c, const unsigned char *data, size_t n) {
 }
 
 static void ws_broadcast_event(const char *type, const char *resource, cJSON *payload_owned) {
+    const cJSON *pid = cJSON_GetObjectItemCaseSensitive(payload_owned, "id");
+    int id = cJSON_IsNumber(pid) ? pid->valueint : 0;
     cJSON *evt = cJSON_CreateObject();
     cJSON_AddStringToObject(evt, "type", type);
     cJSON_AddStringToObject(evt, "resource", resource);
@@ -1703,7 +2196,11 @@ static void ws_broadcast_event(const char *type, const char *resource, cJSON *pa
     if (!text) return;
     size_t len = strlen(text);
     for (int i = 0; i < MAX_CONNS; i++) {
-        if (g_conns[i].in_use && g_conns[i].is_ws) {
+        Conn *w = &g_conns[i];
+        if (!w->in_use || !w->is_ws || w->close_after_flush) continue;
+        if (w->ws_resource[0] && strcmp(w->ws_resource, resource) != 0) continue;   /* other resource */
+        if (w->ws_id && w->ws_id != id) continue;                                     /* other record */
+        {
             ws_send_frame(&g_conns[i], 0x1, (const unsigned char *)text, len);
             conn_try_flush(&g_conns[i]);
         }
@@ -1712,23 +2209,95 @@ static void ws_broadcast_event(const char *type, const char *resource, cJSON *pa
 }
 
 /* ------------------------------------------------------------------------ */
-/* Отложенный сброс данных для PUT .../use                                  */
+/* Write requests: save first, answer after                                 */
 /* ------------------------------------------------------------------------ */
 
-static void schedule_use_flush(void) {
-    double now = mono_now();
-    if (now - g_last_use_flush_mono >= USE_FLUSH_INTERVAL_S) {
-        save_data();
-    } else {
-        g_use_pending = 1;
-        double candidate = g_last_use_flush_mono + USE_FLUSH_INTERVAL_S;
-        if (!g_use_flush_deadline || candidate < g_use_flush_deadline) g_use_flush_deadline = candidate;
+static void save_tokens_refill(double now) {
+    g_save_tokens += (now - g_tokens_mono) / SAVE_TOKEN_S;
+    if (g_save_tokens > SAVE_BURST) g_save_tokens = SAVE_BURST;
+    g_tokens_mono = now;
+}
+
+/* Finishes a create/patch/delete started with undo_begin(): rc != 0 is the
+   handler's error; otherwise the data is saved and only then answered 200 (and
+   broadcast). If the save fails, the change is rolled back and the client gets
+   500, so a retry cannot create duplicates. */
+static void finish_write(Conn *c, int rc, cJSON *out, const char *msg, const char *ev_type, const char *ev_resource) {
+    if (rc) {
+        undo_end(1);
+        if (out) cJSON_Delete(out);
+        http_send_error(c, rc, msg);
+        return;
     }
+    if (!c->is_local) { save_tokens_refill(mono_now()); g_save_tokens -= 1; }
+    g_dirty = 1;
+    if (save_data() != 0) {
+        undo_end(1);
+        cJSON_Delete(out);
+        http_send_error(c, 500, "could not save the data file; the change was not applied");
+        return;
+    }
+    undo_end(0);
+    cJSON *bcast = ev_type ? cJSON_Duplicate(out, 1) : NULL;
+    http_send_json(c, 200, out, -1);
+    if (bcast) ws_broadcast_event(ev_type, ev_resource, bcast);
 }
 
 /* ------------------------------------------------------------------------ */
 /* Маршрутизация HTTP-запросов                                              */
 /* ------------------------------------------------------------------------ */
+
+/* /api/v1/field/{entity}[/{key}]: Spoolman's custom extra-field definitions.
+   microspool keeps no definitions: GET lists none, and a POST that defines one
+   is answered like Spoolman does (the entity's field list, here just the new
+   field) without storing it. Values still live in each record's extra, which is
+   all clients need: HelixScreen defines a field once and then PATCHes extra. */
+static void route_field(Conn *c, const HttpRequestMeta *m, const char *rest, const char *body, size_t body_len) {
+    char entity[16], key[65];
+    const char *slash = strchr(rest, '/');
+    size_t elen = slash ? (size_t)(slash - rest) : strlen(rest);
+    if (elen == 0 || elen >= sizeof entity) { http_send_error(c, 404, "not found"); return; }
+    memcpy(entity, rest, elen); entity[elen] = 0;
+    if (strcmp(entity, "vendor") != 0 && strcmp(entity, "filament") != 0 && strcmp(entity, "spool") != 0) {
+        http_send_error(c, 404, "unknown entity type"); return;
+    }
+    if (!slash) {
+        if (strcmp(m->method, "GET") != 0) { http_send_error(c, 405, "method not allowed"); return; }
+        http_send_json(c, 200, cJSON_CreateArray(), -1);
+        return;
+    }
+    const char *k = slash + 1;
+    size_t klen = strlen(k);
+    if (klen == 0 || klen >= sizeof key) { http_send_error(c, 400, "invalid field key"); return; }
+    for (size_t i = 0; i < klen; i++) {
+        if (!(islower((unsigned char)k[i]) || isdigit((unsigned char)k[i]) || k[i] == '_')) {
+            http_send_error(c, 400, "field key may contain only a-z, 0-9 and _"); return;
+        }
+    }
+    memcpy(key, k, klen + 1);
+    if (strcmp(m->method, "DELETE") == 0) { http_send_json(c, 200, cJSON_CreateArray(), -1); return; }
+    if (strcmp(m->method, "POST") != 0) { http_send_error(c, 405, "method not allowed"); return; }
+    cJSON *in = (body_len && utf8_valid((const unsigned char *)body, body_len)) ? cJSON_ParseWithLength(body, body_len) : NULL;
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(in, "name");
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(in, "field_type");
+    if (!cJSON_IsObject(in) || !cJSON_IsString(name) || !cJSON_IsString(type) ||
+        strlen(name->valuestring) > 256 || strlen(type->valuestring) > 32) {
+        cJSON_Delete(in);
+        http_send_error(c, 400, "name and field_type (strings) are required");
+        return;
+    }
+    cJSON *f = cJSON_CreateObject();
+    cJSON_AddStringToObject(f, "name", name->valuestring);
+    cJSON_AddNumberToObject(f, "order", 0);
+    cJSON_AddStringToObject(f, "field_type", type->valuestring);
+    cJSON_AddStringToObject(f, "key", key);
+    cJSON_AddStringToObject(f, "entity_type", entity);
+    cJSON_AddBoolToObject(f, "multi_choice", 0);
+    cJSON_Delete(in);
+    cJSON *arr = cJSON_CreateArray();
+    cJSON_AddItemToArray(arr, f);
+    http_send_json(c, 200, arr, -1);
+}
 
 static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, size_t body_len) {
     char path[1024];
@@ -1742,13 +2311,10 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         cJSON_AddStringToObject(o, "microspool_version", MICROSPOOL_VERSION);
         cJSON_AddBoolToObject(o, "debug_mode", 0);
         cJSON_AddBoolToObject(o, "automatic_backups", 0);
-        /* realpath() пишет до PATH_MAX (на Linux 4096, на macOS 1024) — буфер меньше PATH_MAX
-           означает затирание стека, поэтому просим glibc/musl выделить память сами (POSIX.1-2008). */
-        char *resolved = realpath(g_data_path, NULL);
-        char abspath[PATH_MAX];
-        snprintf(abspath, sizeof abspath, "%s", resolved ? resolved : g_data_path);
-        free(resolved);
-        cJSON_AddStringToObject(o, "data_dir", abspath);
+        /* Only the file name: the API is open to the LAN, and nobody (Moonraker,
+           Fluidd, Mainsail, HelixScreen) uses data_dir for anything. */
+        const char *slash = strrchr(g_data_path, '/');
+        cJSON_AddStringToObject(o, "data_dir", slash ? slash + 1 : g_data_path);
         cJSON_AddStringToObject(o, "backups_dir", "");
         cJSON_AddStringToObject(o, "db_type", "microspool");
         cJSON_AddNullToObject(o, "git_commit");
@@ -1763,9 +2329,15 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         http_send_json(c, 200, o, -1);
         return;
     }
-    if (strcmp(path, "/api/v1/external/vendor") == 0 || strcmp(path, "/api/v1/external/filament") == 0) {
+    /* No external catalog (SpoolmanDB) on the printer: every lookup is empty,
+       including /api/v1/external/filament/search that HelixScreen calls. */
+    if (strncmp(path, "/api/v1/external/", 17) == 0) {
         if (strcmp(m->method, "GET") != 0) { http_send_error(c, 405, "method not allowed"); return; }
         http_send_json(c, 200, cJSON_CreateArray(), 0);
+        return;
+    }
+    if (strncmp(path, "/api/v1/field/", 14) == 0) {
+        route_field(c, m, path + 14, body, body_len);
         return;
     }
     if (strcmp(path, "/api/v1/setting/currency") == 0) {
@@ -1777,7 +2349,7 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         http_send_json(c, 200, o, -1);
         return;
     }
-    if (strncmp(path, "/api/v1/setting/", 17) == 0) {
+    if (strncmp(path, "/api/v1/setting/", 16) == 0) {
         http_send_error(c, 404, "not found");
         return;
     }
@@ -1829,21 +2401,27 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
                 "request it with \"Accept-Encoding: gzip\".";
             char head[256];
             int hn = snprintf(head, sizeof head,
-                "HTTP/1.1 406 Not Acceptable\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                "HTTP/1.1 406 Not Acceptable\r\nContent-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\n"
                 "Content-Length: %zu\r\nConnection: close\r\n\r\n", sizeof msg - 1);
-            conn_tx_append(c, head, (size_t)hn);
-            conn_tx_append(c, msg, sizeof msg - 1);
-            c->close_after_flush = 1;
+            http_queue_response(c, head, (size_t)hn, msg, sizeof msg - 1);
             return;
         }
-        char head[256];
+        /* CSP: only the page's own inline script (by hash, from embed_ui.py) may run;
+           inline style attributes are used by the UI, hence 'unsafe-inline' for styles.
+           connect-src must reach Moonraker for the active-spool badge: by default
+           http://<host>:7125, but the URL is configurable in the UI, so any
+           http(s) endpoint is allowed for fetch(). */
+        char head[1024];
         int hn = snprintf(head, sizeof head,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
-            "Content-Encoding: gzip\r\nCache-Control: no-cache\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+            "Content-Encoding: gzip\r\nCache-Control: no-cache\r\n"
+            "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n"
+            "Content-Security-Policy: default-src 'none'; script-src " UI_CSP_SCRIPT_SRC "; "
+            "style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http: https:; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"
+            "Content-Length: %u\r\nConnection: close\r\n\r\n",
             UI_INDEX_GZ_LEN);
-        conn_tx_append(c, head, (size_t)hn);
-        conn_tx_append(c, UI_INDEX_GZ, UI_INDEX_GZ_LEN);
-        c->close_after_flush = 1;
+        http_queue_response(c, head, (size_t)hn, UI_INDEX_GZ, UI_INDEX_GZ_LEN);
         return;
     }
 
@@ -1853,6 +2431,10 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         if (body_len == 0) {
             input = cJSON_CreateObject();
         } else {
+            if (!utf8_valid((const unsigned char *)body, body_len)) {
+                http_send_error(c, 400, "request body is not valid UTF-8");
+                return;
+            }
             input = cJSON_ParseWithLength(body, body_len);
             if (!input || !cJSON_IsObject(input)) {
                 if (input) cJSON_Delete(input);
@@ -1864,13 +2446,15 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
 
     if (strcmp(path, "/api/v1/vendor") == 0) {
         if (strcmp(m->method, "GET") == 0) {
-            cJSON *arr; int cnt; vendor_list(&arr, &cnt);
+            ListQuery lq; char msg[300];
+            if (parse_list_query(m->path, &lq, msg, sizeof msg) != 0) { http_send_error(c, 400, msg); goto done; }
+            cJSON *arr; int cnt; vendor_list(&lq, &arr, &cnt);
             http_send_json(c, 200, arr, cnt);
         } else if (strcmp(m->method, "POST") == 0) {
             cJSON *out = NULL; char msg[300];
+            undo_begin();
             int rc = vendor_create(input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg);
-            else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, "added", "vendor");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -1888,11 +2472,13 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
             rc = vendor_get(id, &out, msg, sizeof msg);
             if (rc) http_send_error(c, rc, msg); else http_send_json(c, 200, out, -1);
         } else if (strcmp(m->method, "PATCH") == 0) {
+            undo_begin();
             rc = vendor_patch(id, input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg); else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, "updated", "vendor");
         } else if (strcmp(m->method, "DELETE") == 0) {
+            undo_begin();
             rc = vendor_delete(id, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg); else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, "deleted", "vendor");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -1901,13 +2487,15 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
 
     if (strcmp(path, "/api/v1/filament") == 0) {
         if (strcmp(m->method, "GET") == 0) {
-            cJSON *arr; int cnt; filament_list(&arr, &cnt);
+            ListQuery lq; char msg[300];
+            if (parse_list_query(m->path, &lq, msg, sizeof msg) != 0) { http_send_error(c, 400, msg); goto done; }
+            cJSON *arr; int cnt; filament_list(&lq, &arr, &cnt);
             http_send_json(c, 200, arr, cnt);
         } else if (strcmp(m->method, "POST") == 0) {
             cJSON *out = NULL; char msg[300];
+            undo_begin();
             int rc = filament_create(input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg);
-            else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, "added", "filament");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -1925,11 +2513,13 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
             rc = filament_get(id, &out, msg, sizeof msg);
             if (rc) http_send_error(c, rc, msg); else http_send_json(c, 200, out, -1);
         } else if (strcmp(m->method, "PATCH") == 0) {
+            undo_begin();
             rc = filament_patch(id, input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg); else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, "updated", "filament");
         } else if (strcmp(m->method, "DELETE") == 0) {
+            undo_begin();
             rc = filament_delete(id, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg); else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, "deleted", "filament");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -1939,18 +2529,15 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
     if (strcmp(path, "/api/v1/spool") == 0) {
         if (strcmp(m->method, "GET") == 0) {
             int allow_archived = query_allow_archived(m->path);
-            cJSON *arr; int cnt; spool_list(allow_archived, &arr, &cnt);
+            ListQuery lq; char msg[300];
+            if (parse_list_query(m->path, &lq, msg, sizeof msg) != 0) { http_send_error(c, 400, msg); goto done; }
+            cJSON *arr; int cnt; spool_list(allow_archived, &lq, &arr, &cnt);
             http_send_json(c, 200, arr, cnt);
         } else if (strcmp(m->method, "POST") == 0) {
             cJSON *out = NULL; char msg[300];
+            undo_begin();
             int rc = spool_create(input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg);
-            else {
-                cJSON *bcast = cJSON_Duplicate(out, 1);
-                http_send_json(c, 200, out, -1);
-                save_data();
-                ws_broadcast_event("added", "spool", bcast);
-            }
+            finish_write(c, rc, out, msg, "added", "spool");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -1978,12 +2565,14 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         cJSON *out = NULL; char msg[300]; int rc;
         if (is_use) {
             if (strcmp(m->method, "PUT") != 0) { http_send_error(c, 405, "method not allowed"); goto done; }
+            /* Use reports stay deferred: Moonraker sends one every few seconds
+               while printing; saving each would wear the eMMC. */
             rc = spool_use(id, input, &out, msg, sizeof msg);
             if (rc) http_send_error(c, rc, msg);
             else {
                 cJSON *bcast = cJSON_Duplicate(out, 1);
                 http_send_json(c, 200, out, -1);
-                schedule_use_flush();
+                mark_dirty_deferred();
                 ws_broadcast_event("updated", "spool", bcast);
             }
             goto done;
@@ -1992,23 +2581,13 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
             rc = spool_get(id, &out, msg, sizeof msg);
             if (rc) http_send_error(c, rc, msg); else http_send_json(c, 200, out, -1);
         } else if (strcmp(m->method, "PATCH") == 0) {
+            undo_begin();
             rc = spool_patch(id, input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg);
-            else {
-                cJSON *bcast = cJSON_Duplicate(out, 1);
-                http_send_json(c, 200, out, -1);
-                save_data();
-                ws_broadcast_event("updated", "spool", bcast);
-            }
+            finish_write(c, rc, out, msg, "updated", "spool");
         } else if (strcmp(m->method, "DELETE") == 0) {
+            undo_begin();
             rc = spool_delete(id, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg);
-            else {
-                cJSON *bcast = cJSON_Duplicate(out, 1);
-                http_send_json(c, 200, out, -1);
-                save_data();
-                ws_broadcast_event("deleted", "spool", bcast);
-            }
+            finish_write(c, rc, out, msg, "deleted", "spool");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -2022,8 +2601,173 @@ done:
 }
 
 /* ------------------------------------------------------------------------ */
+/* Request checks against hostile web pages                                 */
+/*                                                                          */
+/* The UI and API listen on the LAN without a login, so any web page open   */
+/* in a LAN browser can send requests here. Three checks keep it out:       */
+/*  - Host allowlist (DNS rebinding): the Host header must be an IP         */
+/*    literal, localhost, this machine's hostname (or hostname.local), or a  */
+/*    name given with -H. Moonraker uses http://127.0.0.1:7912, so its Host  */
+/*    is "127.0.0.1:7912". Requests without a Host header (HTTP/1.0 tools)   */
+/*    pass.                                                                 */
+/*  - Origin: websocket upgrades and every method other than GET/HEAD must  */
+/*    come without an Origin header (non-browser clients such as Moonraker) */
+/*    or from the same origin as the Host they were sent to, or from an     */
+/*    origin given with -o.                                                 */
+/*  - Content-Type: a POST/PATCH/PUT with a body must say application/json; */
+/*    a cross-site form or text/plain POST is refused before parsing.       */
+/* ------------------------------------------------------------------------ */
+
+static void str_lower(char *s) { for (; *s; s++) *s = (char)tolower((unsigned char)*s); }
+
+/* Splits "name[:port]" or "[v6][:port]" into a lower-case name without a
+   trailing dot. Returns -1 if it does not look like a host. */
+static int host_name_part(const char *hostport, char *out, size_t outsz) {
+    const char *end;
+    if (hostport[0] == '[') {
+        end = strchr(hostport, ']');
+        if (!end) return -1;
+        end++;
+    } else {
+        end = strchr(hostport, ':');
+        if (!end) end = hostport + strlen(hostport);
+    }
+    if (*end == ':') {
+        if (!end[1]) return -1;
+        for (const char *p = end + 1; *p; p++) if (!isdigit((unsigned char)*p)) return -1;
+    } else if (*end) {
+        return -1;
+    }
+    size_t n = (size_t)(end - hostport);
+    if (n == 0 || n >= outsz) return -1;
+    memcpy(out, hostport, n);
+    out[n] = 0;
+    if (n > 1 && out[n - 1] == '.') out[n - 1] = 0;
+    str_lower(out);
+    return 0;
+}
+
+static int host_allowed(const char *hostport) {
+    if (g_allow_any_host) return 1;
+    char name[256];
+    if (host_name_part(hostport, name, sizeof name) != 0) return 0;
+    if (name[0] == '[') {
+        char v6[64];
+        size_t n = strlen(name);
+        if (n < 3 || n - 2 >= sizeof v6) return 0;
+        memcpy(v6, name + 1, n - 2); v6[n - 2] = 0;
+        struct in6_addr a6;
+        return inet_pton(AF_INET6, v6, &a6) == 1;
+    }
+    struct in_addr a4;
+    if (inet_pton(AF_INET, name, &a4) == 1) return 1;
+    if (strcmp(name, "localhost") == 0) return 1;
+    if (g_hostname[0]) {
+        size_t hl = strlen(g_hostname);
+        if (strcmp(name, g_hostname) == 0) return 1;
+        if (strncmp(name, g_hostname, hl) == 0 && strcmp(name + hl, ".local") == 0) return 1;
+    }
+    for (int i = 0; i < g_allow_hosts_n; i++) if (str_ieq(name, g_allow_hosts[i])) return 1;
+    return 0;
+}
+
+/* "scheme://host[:port]" -> lower-case "host:port" with the default port made
+   explicit, so "http://a" and Host "a:80" compare equal. */
+static int origin_authority(const char *scheme, const char *hostport, char *out, size_t outsz) {
+    char name[256];
+    if (host_name_part(hostport, name, sizeof name) != 0) return -1;
+    const char *port = hostport[0] == '[' ? strchr(hostport, ']') + 1 : strchr(hostport, ':');
+    const char *p = (port && *port == ':') ? port + 1 : (strcmp(scheme, "https") == 0 ? "443" : "80");
+    int n = snprintf(out, outsz, "%s:%s", name, p);
+    return (n < 0 || (size_t)n >= outsz) ? -1 : 0;
+}
+
+static int origin_allowed(const HttpRequestMeta *m) {
+    if (!m->has_origin) return 1;
+    char want[300];
+    snprintf(want, sizeof want, "%s", m->origin);
+    size_t wl = strlen(want);
+    if (wl && want[wl - 1] == '/') want[wl - 1] = 0;
+    for (int i = 0; i < g_allow_origins_n; i++) if (str_ieq(want, g_allow_origins[i])) return 1;
+    const char *sep = strstr(want, "://");
+    if (!sep || !m->has_host) return 0;   /* includes Origin: null */
+    char scheme[8];
+    size_t sl = (size_t)(sep - want);
+    if (sl == 0 || sl >= sizeof scheme) return 0;
+    memcpy(scheme, want, sl); scheme[sl] = 0;
+    str_lower(scheme);
+    if (strcmp(scheme, "http") != 0 && strcmp(scheme, "https") != 0) return 0;
+    char a[300], b[300];
+    if (origin_authority(scheme, sep + 3, a, sizeof a) != 0) return 0;
+    if (origin_authority(scheme, m->host, b, sizeof b) != 0) return 0;
+    return strcmp(a, b) == 0;
+}
+
+static int content_type_is_json(const char *ct) {
+    char media[128];
+    size_t n = strcspn(ct, ";");
+    while (n > 0 && (ct[n - 1] == ' ' || ct[n - 1] == '\t')) n--;
+    if (n >= sizeof media) return 0;
+    memcpy(media, ct, n); media[n] = 0;
+    return str_ieq(media, "application/json");
+}
+
+/* 0 = go ahead, otherwise an HTTP status has been queued on c. */
+static int request_rejected(Conn *c, const HttpRequestMeta *m) {
+    if (m->has_host && !host_allowed(m->host)) {
+        log_v("refused Host: %s", m->host);
+        http_send_error(c, 403, "host not allowed (start microspool with -H <name> to allow it)");
+        return 403;
+    }
+    int safe_method = str_ieq(m->method, "GET") || str_ieq(m->method, "HEAD");
+    if ((m->is_ws_upgrade || !safe_method) && !origin_allowed(m)) {
+        log_v("refused Origin: %s", m->origin);
+        http_send_error(c, 403, "origin not allowed (start microspool with -o <origin> to allow it)");
+        return 403;
+    }
+    int has_body = m->has_content_length && m->content_length > 0;
+    int body_method = str_ieq(m->method, "POST") || str_ieq(m->method, "PATCH") || str_ieq(m->method, "PUT");
+    if (body_method && has_body && !content_type_is_json(m->content_type)) {
+        http_send_error(c, 415, "Content-Type must be application/json");
+        return 415;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Обработка входящих байт на HTTP-соединении                               */
 /* ------------------------------------------------------------------------ */
+
+static void conn_dispatch(Conn *c) {
+    const char *body = c->rx + c->header_body_offset;
+    route_and_dispatch(c, &c->meta, body, (size_t)c->content_length);
+    c->state = CS_HTTP_CLOSING;
+    conn_try_flush(c);
+}
+
+/* Requests that save synchronously (everything that writes except use reports). */
+static int request_may_save(const HttpRequestMeta *m) {
+    if (str_ieq(m->method, "GET") || str_ieq(m->method, "HEAD")) return 0;
+    char path[1024];
+    split_path(m->path, path, sizeof path);
+    size_t n = strlen(path);
+    return !(n >= 4 && strcmp(path + n - 4, "/use") == 0);
+}
+
+/* Runs held LAN write requests, oldest first, while save tokens last. */
+static void dispatch_held_requests(double now) {
+    for (;;) {
+        save_tokens_refill(now);
+        if (g_save_tokens < 1) return;
+        Conn *next = NULL;
+        for (int i = 0; i < MAX_CONNS; i++) {
+            Conn *c = &g_conns[i];
+            if (c->in_use && c->state == CS_HTTP_HELD && (!next || c->accepted_mono < next->accepted_mono)) next = c;
+        }
+        if (!next) return;
+        conn_dispatch(next);
+    }
+}
 
 static void process_http_buffer(Conn *c) {
     if (c->state == CS_HTTP_HEADERS) {
@@ -2045,9 +2789,52 @@ static void process_http_buffer(Conn *c) {
             return;
         }
 
+        if (request_rejected(c, &meta)) {
+            c->state = CS_HTTP_CLOSING;
+            conn_try_flush(c);
+            return;
+        }
+
         char path_only[1024];
         split_path(meta.path, path_only, sizeof path_only);
         if (meta.is_ws_upgrade && str_ieq(meta.method, "GET") && strncmp(path_only, "/api/v1/", 8) == 0) {
+            int remote_ws = 0;
+            for (int i = 0; i < MAX_CONNS; i++)
+                if (g_conns[i].in_use && g_conns[i].is_ws && !g_conns[i].is_local) remote_ws++;
+            if (meta.ws_key[0] == 0) {
+                http_send_error(c, 400, "missing Sec-WebSocket-Key");
+                c->state = CS_HTTP_CLOSING;
+                conn_try_flush(c);
+                return;
+            }
+            /* Spoolman's websocket paths: /api/v1/ (everything), /api/v1/<resource>
+               and /api/v1/<resource>/<id>. Moonraker uses /api/v1/spool. */
+            const char *sub = path_only + 7;   /* after "/api/v1" */
+            char res[12] = "";
+            long sub_id = 0;
+            if (*sub == '/') sub++;
+            if (*sub) {
+                size_t rl = strcspn(sub, "/");
+                if (rl < sizeof res) { memcpy(res, sub, rl); res[rl] = 0; }
+                char *endp = NULL;
+                if (sub[rl] == '/') sub_id = strtol(sub + rl + 1, &endp, 10);
+                int bad_res = strcmp(res, "vendor") != 0 && strcmp(res, "filament") != 0 && strcmp(res, "spool") != 0;
+                int bad_id = sub[rl] == '/' && (!sub[rl + 1] || *endp || sub_id <= 0 || sub_id >= INT_MAX);
+                if (bad_res || bad_id) {
+                    http_send_error(c, 404, "no websocket at this path");
+                    c->state = CS_HTTP_CLOSING;
+                    conn_try_flush(c);
+                    return;
+                }
+            }
+            memcpy(c->ws_resource, res, sizeof res);
+            c->ws_id = (int)sub_id;
+            if (!c->is_local && remote_ws >= MAX_REMOTE_WS) {
+                http_send_error(c, 503, "too many websocket clients");
+                c->state = CS_HTTP_CLOSING;
+                conn_try_flush(c);
+                return;
+            }
             ws_send_handshake(c, meta.ws_key);
             conn_try_flush(c);
             return;
@@ -2075,10 +2862,11 @@ static void process_http_buffer(Conn *c) {
     if (c->state == CS_HTTP_BODY) {
         size_t need = c->header_body_offset + (size_t)c->content_length;
         if (c->rx_len < need) return;
-        const char *body = c->rx + c->header_body_offset;
-        route_and_dispatch(c, &c->meta, body, (size_t)c->content_length);
-        c->state = CS_HTTP_CLOSING;
-        conn_try_flush(c);
+        if (!c->is_local && request_may_save(&c->meta)) {
+            save_tokens_refill(mono_now());
+            if (g_save_tokens < 1) { c->state = CS_HTTP_HELD; return; }
+        }
+        conn_dispatch(c);
     }
 }
 
@@ -2087,11 +2875,14 @@ static void conn_on_readable(Conn *c) {
     for (;;) {
         ssize_t r = recv(c->fd, buf, sizeof buf, 0);
         if (r > 0) {
-            c->last_activity_mono = mono_now();
             if (c->state == CS_WS) {
+                c->last_rx_mono = mono_now();
                 ws_feed(c, buf, (size_t)r);
                 conn_try_flush(c);
                 if (!c->in_use) return;
+            } else if (c->state == CS_HTTP_CLOSING || c->state == CS_HTTP_HELD) {
+                /* The request is complete and answered: read and drop whatever else
+                   arrives (bounded by the request deadline) instead of growing rx. */
             } else {
                 if (conn_rx_reserve(c, (size_t)r) != 0) { conn_reset(c); return; }
                 memcpy(c->rx + c->rx_len, buf, (size_t)r);
@@ -2106,6 +2897,10 @@ static void conn_on_readable(Conn *c) {
             }
             if ((size_t)r < sizeof buf) break;
         } else if (r == 0) {
+            if ((c->state == CS_HTTP_CLOSING && c->tx_len > c->tx_sent) || c->state == CS_HTTP_HELD) {
+                c->rd_eof = 1;   /* half-closed after the request: still deliver the answer */
+                return;
+            }
             conn_reset(c);
             return;
         } else {
@@ -2121,14 +2916,155 @@ static void conn_on_writable(Conn *c) {
     conn_try_flush(c);
 }
 
+/* Next moment this connection needs attention (deadline, ping, timeout). */
+static double conn_next_deadline(const Conn *c) {
+    if (!c->in_use) return 1e300;
+    if (!c->is_ws) return c->accepted_mono + HTTP_REQUEST_DEADLINE_S;
+    if (g_ws_ping_interval <= 0) return 1e300;
+    double ping = c->last_ping_sent_mono + g_ws_ping_interval;
+    double dead = c->last_rx_mono + (double)WS_TIMEOUT_PINGS * g_ws_ping_interval;
+    return ping < dead ? ping : dead;
+}
+
+static void conn_run_timers(Conn *c, double now) {
+    if (!c->in_use) return;
+    if (!c->is_ws) {
+        /* One deadline from accept for headers, body and sending the answer;
+           trickling a byte at a time does not extend it (slowloris). */
+        if (now - c->accepted_mono >= HTTP_REQUEST_DEADLINE_S) {
+            log_v("request deadline passed, closing connection");
+            conn_reset(c);
+        }
+        return;
+    }
+    if (g_ws_ping_interval <= 0) return;   /* -k 0: no pings, so no idle timeout either */
+    if (now - c->last_rx_mono >= (double)WS_TIMEOUT_PINGS * g_ws_ping_interval) {
+        /* Tornado (Moonraker) answers every ping with a pong, so a live client
+           always sends something within one interval. */
+        log_v("websocket peer silent for %.0f s, closing", now - c->last_rx_mono);
+        conn_reset(c);
+        return;
+    }
+    if (now - c->last_ping_sent_mono >= g_ws_ping_interval) {
+        ws_send_frame(c, 0x9, NULL, 0);
+        c->last_ping_sent_mono = now;
+        conn_try_flush(c);
+    }
+}
+
+/* Oldest connection matching the filter that is a candidate for eviction. */
+static Conn *conn_pick_victim(int remote_only, int incomplete_only, double min_age, double now) {
+    Conn *victim = NULL;
+    for (int i = 0; i < MAX_CONNS; i++) {
+        Conn *c = &g_conns[i];
+        if (!c->in_use || c->is_ws) continue;
+        if (remote_only && c->is_local) continue;
+        if (incomplete_only && c->state != CS_HTTP_HEADERS && c->state != CS_HTTP_BODY) continue;
+        if (now - c->accepted_mono < min_age) continue;
+        if (!victim || c->accepted_mono < victim->accepted_mono) victim = c;
+    }
+    return victim;
+}
+
+/* Accepts all pending connections and decides who gets a slot:
+   - local peers (127.0.0.1 or the machine's own address) may use every slot and,
+     when all are taken, push out the oldest LAN HTTP connection;
+   - LAN peers share MAX_CONNS - LOCAL_RESERVED_CONNS slots, at most
+     MAX_CONNS_PER_PEER per address; when their pool is full, a new LAN client
+     evicts the oldest LAN connection that has not finished sending its request
+     within EVICT_MIN_AGE_S (slow or idle sockets), otherwise it is closed. */
+static void accept_clients(int lfd) {
+    for (;;) {
+        struct sockaddr_in cliaddr, locaddr;
+        socklen_t clilen = sizeof cliaddr, loclen = sizeof locaddr;
+        int cfd = accept(lfd, (struct sockaddr *)&cliaddr, &clilen);
+        if (cfd < 0) {
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            break;
+        }
+        int is_local = cliaddr.sin_addr.s_addr == htonl(INADDR_LOOPBACK);
+        if (!is_local && getsockname(cfd, (struct sockaddr *)&locaddr, &loclen) == 0 &&
+            locaddr.sin_addr.s_addr == cliaddr.sin_addr.s_addr) is_local = 1;
+
+        double now = mono_now();
+        int remote = 0, same_peer = 0, free_slot = -1;
+        for (int i = 0; i < MAX_CONNS; i++) {
+            if (!g_conns[i].in_use) { if (free_slot < 0) free_slot = i; continue; }
+            if (g_conns[i].is_local) continue;
+            remote++;
+            if (g_conns[i].peer.s_addr == cliaddr.sin_addr.s_addr) same_peer++;
+        }
+        Conn *victim = NULL;
+        if (!is_local) {
+            if (same_peer >= MAX_CONNS_PER_PEER) {
+                log_v("%s: too many connections from this address", inet_ntoa(cliaddr.sin_addr));
+                close(cfd);
+                continue;
+            }
+            if (remote >= MAX_CONNS - LOCAL_RESERVED_CONNS || free_slot < 0) {
+                victim = conn_pick_victim(1, 1, EVICT_MIN_AGE_S, now);
+                if (!victim) { log_v("LAN connection pool full, refusing"); close(cfd); continue; }
+            }
+        } else if (free_slot < 0) {
+            victim = conn_pick_victim(1, 0, 0, now);
+            if (!victim) { log_v("all connection slots taken by local clients, refusing"); close(cfd); continue; }
+        }
+        if (victim) {
+            log_v("evicting an old LAN connection to make room");
+            conn_reset(victim);
+            free_slot = (int)(victim - g_conns);
+        }
+
+        fcntl(cfd, F_SETFL, O_NONBLOCK);
+        fcntl(cfd, F_SETFD, FD_CLOEXEC);
+        int one = 1;
+        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        Conn *c = &g_conns[free_slot];
+        conn_clear_keep_buffers(c);   /* keeps the slot's small buffers (see above) */
+        g_conn_gen[free_slot]++;
+        c->fd = cfd;
+        c->in_use = 1;
+        c->is_local = is_local;
+        c->peer = cliaddr.sin_addr;
+        c->state = CS_HTTP_HEADERS;
+        c->accepted_mono = now;
+        c->content_length = -1;
+    }
+}
+
 /* ------------------------------------------------------------------------ */
 /* main: аргументы, сокет, сигналы, event loop                              */
 /* ------------------------------------------------------------------------ */
 
+static volatile sig_atomic_t g_flush_requested = 0;
 static void on_term_signal(int sig) { (void)sig; g_should_exit = 1; }
+static void on_hup_signal(int sig) { (void)sig; g_flush_requested = 1; }
+
+/* g_data_dir, g_bak_path, g_corrupt_path from g_data_path. */
+static int setup_data_paths(void) {
+    const char *slash = strrchr(g_data_path, '/');
+    if (slash) {
+        size_t n = (size_t)(slash - g_data_path);
+        if (n == 0) n = 1;   /* "/file" -> "/" */
+        if (n >= sizeof g_data_dir) return -1;
+        memcpy(g_data_dir, g_data_path, n);
+        g_data_dir[n] = 0;
+    }
+    int a = snprintf(g_bak_path, sizeof g_bak_path, "%s.bak", g_data_path);
+    int b = snprintf(g_corrupt_path, sizeof g_corrupt_path, "%s.corrupt", g_data_path);
+    if (a < 0 || (size_t)a >= sizeof g_bak_path || b < 0 || (size_t)b >= sizeof g_corrupt_path) return -1;
+    return 0;
+}
 
 static void print_usage(const char *argv0) {
-    fprintf(stderr, "usage: %s [-l addr] [-p port] [-d datafile] [-v] [-V] [-U]\n", argv0);
+    fprintf(stderr,
+        "usage: %s [-l addr] [-p port] [-d datafile] [-k ping_s] [-H host]... [-o origin]... [-v] [-V] [-U]\n"
+        "  -k  websocket ping interval in seconds (default %d, 0 = off); silent peers are\n"
+        "      closed after %d intervals\n"
+        "  -H  extra Host name to accept besides IP literals, localhost, the hostname and\n"
+        "      hostname.local (repeatable; '*' accepts any Host)\n"
+        "  -o  extra browser Origin allowed to write and open websockets, e.g.\n"
+        "      http://printer.lan (repeatable)\n", argv0, WS_PING_INTERVAL_S, WS_TIMEOUT_PINGS);
 }
 
 int main(int argc, char **argv) {
@@ -2137,6 +3073,16 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) g_listen_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) g_data_path = argv[++i];
         else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) g_ws_ping_interval = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-H") == 0 && i + 1 < argc) {
+            const char *h = argv[++i];
+            if (strcmp(h, "*") == 0) g_allow_any_host = 1;
+            else if (g_allow_hosts_n < MAX_ALLOW_NAMES) g_allow_hosts[g_allow_hosts_n++] = h;
+            else { fprintf(stderr, "microspool: too many -H names (max %d)\n", MAX_ALLOW_NAMES); return 1; }
+        }
+        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+            if (g_allow_origins_n < MAX_ALLOW_NAMES) g_allow_origins[g_allow_origins_n++] = argv[++i];
+            else { fprintf(stderr, "microspool: too many -o origins (max %d)\n", MAX_ALLOW_NAMES); return 1; }
+        }
         else if (strcmp(argv[i], "-v") == 0) g_verbose = 1;
         else if (strcmp(argv[i], "-U") == 0) g_ui_enabled = 0;
         else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
@@ -2146,17 +3092,27 @@ int main(int argc, char **argv) {
         else { print_usage(argv[0]); return 1; }
     }
 
+    if (gethostname(g_hostname, sizeof g_hostname - 1) != 0) g_hostname[0] = 0;
+    g_hostname[sizeof g_hostname - 1] = 0;
+    str_lower(g_hostname);
+
+    if (setup_data_paths() != 0) { fprintf(stderr, "microspool: data file path too long\n"); return 1; }
     if (load_data() != 0) {
-        fprintf(stderr, "microspool: файл данных повреждён, выхожу без изменений\n");
+        fprintf(stderr, "microspool: файл данных повреждён или недоступен, выхожу без изменений\n");
         return 1;
     }
-    g_last_use_flush_mono = mono_now();
+    remove_stale_temp_files();
+    g_tokens_mono = mono_now();
 
     struct sigaction sa_term;
     memset(&sa_term, 0, sizeof sa_term);
     sa_term.sa_handler = on_term_signal;
     sigaction(SIGTERM, &sa_term, NULL);
     sigaction(SIGINT, &sa_term, NULL);
+    struct sigaction sa_hup;
+    memset(&sa_hup, 0, sizeof sa_hup);
+    sa_hup.sa_handler = on_hup_signal;
+    sigaction(SIGHUP, &sa_hup, NULL);   /* SIGHUP: save now and keep running */
     signal(SIGPIPE, SIG_IGN);
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -2182,71 +3138,56 @@ int main(int argc, char **argv) {
     while (!g_should_exit) {
         struct pollfd pfds[1 + MAX_CONNS];
         Conn *conn_for_pfd[1 + MAX_CONNS];
+        unsigned gen_for_pfd[1 + MAX_CONNS];
         int nfds = 0;
         pfds[nfds].fd = lfd; pfds[nfds].events = POLLIN; conn_for_pfd[nfds] = NULL; nfds++;
         for (int i = 0; i < MAX_CONNS; i++) {
             if (!g_conns[i].in_use) continue;
-            short events = POLLIN;
+            short events = g_conns[i].rd_eof ? 0 : POLLIN;
             if (g_conns[i].tx_len > g_conns[i].tx_sent) events |= POLLOUT;
             pfds[nfds].fd = g_conns[i].fd;
             pfds[nfds].events = events;
             pfds[nfds].revents = 0;
             conn_for_pfd[nfds] = &g_conns[i];
+            gen_for_pfd[nfds] = g_conn_gen[i];
             nfds++;
         }
 
         double now = mono_now();
         double next_deadline = now + 5.0;
         for (int i = 0; i < MAX_CONNS; i++) {
-            if (!g_conns[i].in_use) continue;
-            double d = g_conns[i].is_ws
-                ? g_conns[i].last_ping_sent_mono + WS_PING_INTERVAL_S
-                : g_conns[i].last_activity_mono + HTTP_IDLE_TIMEOUT_S;
+            double d = conn_next_deadline(&g_conns[i]);
             if (d < next_deadline) next_deadline = d;
         }
-        if (g_use_pending && g_use_flush_deadline < next_deadline) next_deadline = g_use_flush_deadline;
+        if (g_dirty && g_save_due < next_deadline) next_deadline = g_save_due;
+        for (int i = 0; i < MAX_CONNS; i++) {
+            if (g_conns[i].in_use && g_conns[i].state == CS_HTTP_HELD) {
+                double t = now + (1 - g_save_tokens) * SAVE_TOKEN_S;
+                if (t < next_deadline) next_deadline = t;
+                break;
+            }
+        }
         double timeout_s = next_deadline - now;
         if (timeout_s < 0) timeout_s = 0;
-        int timeout_ms = (int)(timeout_s * 1000.0);
+        int timeout_ms = (int)(timeout_s * 1000.0) + 1;
 
         int pr = poll(pfds, (nfds_t)nfds, timeout_ms);
         if (pr < 0) {
-            if (errno == EINTR) continue;
-            perror("poll");
-            break;
+            if (errno != EINTR) { perror("poll"); break; }
+            pr = 0;
+            for (int k = 0; k < nfds; k++) pfds[k].revents = 0;
+        }
+        if (g_flush_requested) {
+            g_flush_requested = 0;
+            if (g_dirty) { log_v("SIGHUP: saving"); save_data(); }
         }
 
-        if (pfds[0].revents & POLLIN) {
-            for (;;) {
-                struct sockaddr_in cliaddr;
-                socklen_t clilen = sizeof cliaddr;
-                int cfd = accept(lfd, (struct sockaddr *)&cliaddr, &clilen);
-                if (cfd < 0) break;
-                int slot = -1;
-                for (int i = 0; i < MAX_CONNS; i++) if (!g_conns[i].in_use) { slot = i; break; }
-                if (slot < 0) { close(cfd); continue; }
-                fcntl(cfd, F_SETFL, O_NONBLOCK);
-                int one = 1;
-                setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-                /* сохраняем ёмкость rx/tx буферов слота (см. conn_reset) — иначе
-                   memset ниже "теряет" ранее выделенную память слота (утечка) */
-                char *saved_rx = g_conns[slot].rx; size_t saved_rx_cap = g_conns[slot].rx_cap;
-                char *saved_tx = g_conns[slot].tx; size_t saved_tx_cap = g_conns[slot].tx_cap;
-                memset(&g_conns[slot], 0, sizeof g_conns[slot]);
-                g_conns[slot].rx = saved_rx; g_conns[slot].rx_cap = saved_rx_cap;
-                g_conns[slot].tx = saved_tx; g_conns[slot].tx_cap = saved_tx_cap;
-                g_conns[slot].fd = cfd;
-                g_conns[slot].in_use = 1;
-                g_conns[slot].state = CS_HTTP_HEADERS;
-                g_conns[slot].last_activity_mono = mono_now();
-                g_conns[slot].content_length = -1;
-            }
-        }
+        if (pfds[0].revents & POLLIN) accept_clients(lfd);
 
         for (int k = 1; k < nfds; k++) {
             Conn *c = conn_for_pfd[k];
-            if (!c || !c->in_use) continue;
-            if (pfds[k].revents & (POLLHUP | POLLERR)) { conn_reset(c); continue; }
+            if (!c || !c->in_use || gen_for_pfd[k] != g_conn_gen[c - g_conns]) continue;
+            if (pfds[k].revents & (POLLHUP | POLLERR | POLLNVAL)) { conn_reset(c); continue; }
             if (pfds[k].revents & POLLIN) {
                 conn_on_readable(c);
                 if (!c->in_use) continue;
@@ -2258,26 +3199,19 @@ int main(int argc, char **argv) {
         }
 
         now = mono_now();
-        for (int i = 0; i < MAX_CONNS; i++) {
-            Conn *c = &g_conns[i];
-            if (!c->in_use) continue;
-            if (c->is_ws) {
-                if (g_ws_ping_interval > 0 && now - c->last_ping_sent_mono >= g_ws_ping_interval) {
-                    ws_send_frame(c, 0x9, NULL, 0);
-                    c->last_ping_sent_mono = now;
-                    conn_try_flush(c);
-                }
-            } else {
-                if (now - c->last_activity_mono >= HTTP_IDLE_TIMEOUT_S) conn_reset(c);
-            }
-        }
+        for (int i = 0; i < MAX_CONNS; i++) conn_run_timers(&g_conns[i], now);
 
-        if (g_use_pending && now >= g_use_flush_deadline) save_data();
+        dispatch_held_requests(now);
+        if (g_dirty && now >= g_save_due) save_data();
     }
 
-    save_data();
+    int exit_rc = 0;
+    if (g_dirty && save_data() != 0) {
+        fprintf(stderr, "microspool: could not save %s on exit, recent changes are lost\n", g_data_path);
+        exit_rc = 1;
+    }
     log_v("получен сигнал завершения, данные сохранены");
     for (int i = 0; i < MAX_CONNS; i++) if (g_conns[i].in_use) conn_reset(&g_conns[i]);
     close(lfd);
-    return 0;
+    return exit_rc;
 }

@@ -9,8 +9,11 @@ embed_ui.py — сжимает ui/index.html (gzip -9) и генерирует C
 Использование:
     python3 tools/embed_ui.py ui/index.html build/ui_gz.h
 """
+import base64
 import gzip
+import hashlib
 import os
+import re
 import sys
 
 BYTES_PER_LINE = 20
@@ -43,6 +46,19 @@ def main() -> int:
         lines.append(",".join(str(b) for b in chunk) + ",")
     lines.append("};")
     lines.append("static const unsigned int UI_INDEX_GZ_LEN = %uu;" % len(compressed))
+
+    # Content-Security-Policy: allow exactly the inline <script> blocks of this
+    # page by hash, so injected markup cannot run script. Scripts with
+    # attributes (src=, type=...) and inline on*= handlers are not supported.
+    text = html.decode("utf-8")
+    if re.search(r"<script\s[^>]*>", text, re.I) or re.search(r"\son[a-z]+=[\"']", text, re.I):
+        print("embed_ui.py: only plain inline <script> blocks are allowed (CSP hashes)", file=sys.stderr)
+        return 1
+    hashes = []
+    for m in re.finditer(r"<script>(.*?)</script>", text, re.S):
+        digest = hashlib.sha256(m.group(1).encode("utf-8")).digest()
+        hashes.append("'sha256-%s'" % base64.b64encode(digest).decode("ascii"))
+    lines.append('#define UI_CSP_SCRIPT_SRC "%s"' % (" ".join(hashes) or "'none'"))
     lines.append("")
 
     with open(dst_path, "w", encoding="ascii") as f:

@@ -10,11 +10,13 @@
 VERSION     ?= 0.2.1
 CC_NATIVE   ?= cc
 PYTHON3     ?= python3
-CFLAGS      := -std=c11 -Wall -Wextra -O2 -Ivendor -I. -DMICROSPOOL_VERSION=\"$(VERSION)\"
+# 64-bit time_t and off_t on 32-bit glibc targets (MIPS32, ARMv7); no-op on 64-bit and musl.
+LFS_CFLAGS  := -D_FILE_OFFSET_BITS=64 -D_TIME_BITS=64
+CFLAGS      := -std=c11 -Wall -Wextra -O2 -Ivendor -I. -DMICROSPOOL_VERSION=\"$(VERSION)\" $(LFS_CFLAGS)
 LDFLAGS_NATIVE := -lm
 
 ZIG         ?= zig
-CROSS_CFLAGS  := -std=c11 -Wall -Wextra -Os -Ivendor -I. -DMICROSPOOL_VERSION=\"$(VERSION)\" \
+CROSS_CFLAGS  := -std=c11 -Wall -Wextra -Os -Ivendor -I. -DMICROSPOOL_VERSION=\"$(VERSION)\" $(LFS_CFLAGS) \
                  -ffunction-sections -fdata-sections
 CROSS_LDFLAGS := -static -s -Wl,--gc-sections -lm
 
