@@ -21,7 +21,8 @@ python3 tools/embed_ui.py ui/index.html build/ui_gz.h
 	-Wl,--gc-sections -s -lm
 {
 	echo "bin/microspool: microspool $VERSION (kiln-microspool $KILN)"
-	echo "source: this repository at $(git rev-parse HEAD 2>/dev/null || echo unknown)$(git diff --quiet 2>/dev/null || echo ' (with local changes)')"
+	# SOURCE_COMMIT: for a build from an exported tree (git archive)
+	echo "source: this repository at ${SOURCE_COMMIT:-$(git rev-parse HEAD 2>/dev/null || echo unknown)$(git diff --quiet HEAD 2>/dev/null || echo ' (with local changes)')}"
 	echo "compiler: $("$CC" --version | head -1)"
 	echo "sha256: $(sha256sum bin/microspool | cut -d' ' -f1)"
 } > bin/SOURCES
