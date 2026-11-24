@@ -86,6 +86,15 @@ static const char *g_data_path   = "./microspool.json";
 static int         g_verbose     = 0;
 static int         g_ui_enabled  = 1;   /* -U отключает встроенный веб-интерфейс */
 
+/* Host / Origin allowlists (see request_allowed). */
+#define MAX_ALLOW_NAMES 16
+static const char *g_allow_hosts[MAX_ALLOW_NAMES];    /* -H name (or -H '*' for any) */
+static int         g_allow_hosts_n = 0;
+static int         g_allow_any_host = 0;
+static const char *g_allow_origins[MAX_ALLOW_NAMES];  /* -o http://host[:port] */
+static int         g_allow_origins_n = 0;
+static char        g_hostname[256];                   /* gethostname(), lower case */
+
 static volatile sig_atomic_t g_should_exit = 0;
 
 static void log_v(const char *fmt, ...) {
@@ -1352,6 +1361,9 @@ typedef struct {
     int  is_ws_upgrade;
     char ws_key[192];
     int  accepts_gzip;    /* Accept-Encoding содержит "gzip" (для GET /, /index.html) */
+    int  has_host;     char host[256];
+    int  has_origin;   char origin[256];
+    char content_type[128];
 } HttpRequestMeta;
 
 static const char *find_header_end(const char *buf, size_t len) {
@@ -1408,6 +1420,16 @@ static int parse_http_request_line_and_headers(const char *buf, size_t hdr_len, 
             if (ci_contains(val, "gzip")) m->accepts_gzip = 1;
         } else if (str_ieq(key, "Sec-WebSocket-Key")) {
             strncpy(m->ws_key, val, sizeof m->ws_key - 1);
+        } else if (str_ieq(key, "Host")) {
+            if (m->has_host || strlen(val) >= sizeof m->host) return -1;   /* duplicate or oversized */
+            m->has_host = 1;
+            memcpy(m->host, val, strlen(val) + 1);
+        } else if (str_ieq(key, "Origin")) {
+            if (m->has_origin || strlen(val) >= sizeof m->origin) return -1;
+            m->has_origin = 1;
+            memcpy(m->origin, val, strlen(val) + 1);
+        } else if (str_ieq(key, "Content-Type")) {
+            strncpy(m->content_type, val, sizeof m->content_type - 1);
         }
     }
     m->is_ws_upgrade = upgrade_hdr;
@@ -1586,7 +1608,10 @@ static const char *status_text_for(int code) {
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
         case 411: return "Length Required";
+        case 403: return "Forbidden";
         case 413: return "Payload Too Large";
+        case 415: return "Unsupported Media Type";
+        case 500: return "Internal Server Error";
         case 503: return "Service Unavailable";
         default:  return "Error";
     }
@@ -1616,11 +1641,11 @@ static void http_send_json(Conn *c, int status, cJSON *body_owned, int total_cou
     int hn;
     if (total_count >= 0) {
         hn = snprintf(head, sizeof head,
-            "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nX-Total-Count: %d\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nContent-Length: %zu\r\nX-Total-Count: %d\r\nConnection: close\r\n\r\n",
             status, status_text_for(status), blen, total_count);
     } else {
         hn = snprintf(head, sizeof head,
-            "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nX-Content-Type-Options: nosniff\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
             status, status_text_for(status), blen);
     }
     http_queue_response(c, head, (size_t)hn, json_text, blen);
@@ -1903,15 +1928,25 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
                 "request it with \"Accept-Encoding: gzip\".";
             char head[256];
             int hn = snprintf(head, sizeof head,
-                "HTTP/1.1 406 Not Acceptable\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                "HTTP/1.1 406 Not Acceptable\r\nContent-Type: text/plain; charset=utf-8\r\nX-Content-Type-Options: nosniff\r\n"
                 "Content-Length: %zu\r\nConnection: close\r\n\r\n", sizeof msg - 1);
             http_queue_response(c, head, (size_t)hn, msg, sizeof msg - 1);
             return;
         }
-        char head[256];
+        /* CSP: only the page's own inline script (by hash, from embed_ui.py) may run;
+           inline style attributes are used by the UI, hence 'unsafe-inline' for styles.
+           connect-src must reach Moonraker for the active-spool badge: by default
+           http://<host>:7125, but the URL is configurable in the UI, so any
+           http(s) endpoint is allowed for fetch(). */
+        char head[1024];
         int hn = snprintf(head, sizeof head,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
-            "Content-Encoding: gzip\r\nCache-Control: no-cache\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
+            "Content-Encoding: gzip\r\nCache-Control: no-cache\r\n"
+            "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n"
+            "Content-Security-Policy: default-src 'none'; script-src " UI_CSP_SCRIPT_SRC "; "
+            "style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http: https:; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"
+            "Content-Length: %u\r\nConnection: close\r\n\r\n",
             UI_INDEX_GZ_LEN);
         http_queue_response(c, head, (size_t)hn, UI_INDEX_GZ, UI_INDEX_GZ_LEN);
         return;
@@ -2092,6 +2127,140 @@ done:
 }
 
 /* ------------------------------------------------------------------------ */
+/* Request checks against hostile web pages                                 */
+/*                                                                          */
+/* The UI and API listen on the LAN without a login, so any web page open   */
+/* in a LAN browser can send requests here. Three checks keep it out:       */
+/*  - Host allowlist (DNS rebinding): the Host header must be an IP         */
+/*    literal, localhost, this machine's hostname (or hostname.local), or a  */
+/*    name given with -H. Moonraker uses http://127.0.0.1:7912, so its Host  */
+/*    is "127.0.0.1:7912". Requests without a Host header (HTTP/1.0 tools)   */
+/*    pass.                                                                 */
+/*  - Origin: websocket upgrades and every method other than GET/HEAD must  */
+/*    come without an Origin header (non-browser clients such as Moonraker) */
+/*    or from the same origin as the Host they were sent to, or from an     */
+/*    origin given with -o.                                                 */
+/*  - Content-Type: a POST/PATCH/PUT with a body must say application/json; */
+/*    a cross-site form or text/plain POST is refused before parsing.       */
+/* ------------------------------------------------------------------------ */
+
+static void str_lower(char *s) { for (; *s; s++) *s = (char)tolower((unsigned char)*s); }
+
+/* Splits "name[:port]" or "[v6][:port]" into a lower-case name without a
+   trailing dot. Returns -1 if it does not look like a host. */
+static int host_name_part(const char *hostport, char *out, size_t outsz) {
+    const char *end;
+    if (hostport[0] == '[') {
+        end = strchr(hostport, ']');
+        if (!end) return -1;
+        end++;
+    } else {
+        end = strchr(hostport, ':');
+        if (!end) end = hostport + strlen(hostport);
+    }
+    if (*end == ':') {
+        if (!end[1]) return -1;
+        for (const char *p = end + 1; *p; p++) if (!isdigit((unsigned char)*p)) return -1;
+    } else if (*end) {
+        return -1;
+    }
+    size_t n = (size_t)(end - hostport);
+    if (n == 0 || n >= outsz) return -1;
+    memcpy(out, hostport, n);
+    out[n] = 0;
+    if (n > 1 && out[n - 1] == '.') out[n - 1] = 0;
+    str_lower(out);
+    return 0;
+}
+
+static int host_allowed(const char *hostport) {
+    if (g_allow_any_host) return 1;
+    char name[256];
+    if (host_name_part(hostport, name, sizeof name) != 0) return 0;
+    if (name[0] == '[') {
+        char v6[64];
+        size_t n = strlen(name);
+        if (n < 3 || n - 2 >= sizeof v6) return 0;
+        memcpy(v6, name + 1, n - 2); v6[n - 2] = 0;
+        struct in6_addr a6;
+        return inet_pton(AF_INET6, v6, &a6) == 1;
+    }
+    struct in_addr a4;
+    if (inet_pton(AF_INET, name, &a4) == 1) return 1;
+    if (strcmp(name, "localhost") == 0) return 1;
+    if (g_hostname[0]) {
+        size_t hl = strlen(g_hostname);
+        if (strcmp(name, g_hostname) == 0) return 1;
+        if (strncmp(name, g_hostname, hl) == 0 && strcmp(name + hl, ".local") == 0) return 1;
+    }
+    for (int i = 0; i < g_allow_hosts_n; i++) if (str_ieq(name, g_allow_hosts[i])) return 1;
+    return 0;
+}
+
+/* "scheme://host[:port]" -> lower-case "host:port" with the default port made
+   explicit, so "http://a" and Host "a:80" compare equal. */
+static int origin_authority(const char *scheme, const char *hostport, char *out, size_t outsz) {
+    char name[256];
+    if (host_name_part(hostport, name, sizeof name) != 0) return -1;
+    const char *port = hostport[0] == '[' ? strchr(hostport, ']') + 1 : strchr(hostport, ':');
+    const char *p = (port && *port == ':') ? port + 1 : (strcmp(scheme, "https") == 0 ? "443" : "80");
+    int n = snprintf(out, outsz, "%s:%s", name, p);
+    return (n < 0 || (size_t)n >= outsz) ? -1 : 0;
+}
+
+static int origin_allowed(const HttpRequestMeta *m) {
+    if (!m->has_origin) return 1;
+    char want[300];
+    snprintf(want, sizeof want, "%s", m->origin);
+    size_t wl = strlen(want);
+    if (wl && want[wl - 1] == '/') want[wl - 1] = 0;
+    for (int i = 0; i < g_allow_origins_n; i++) if (str_ieq(want, g_allow_origins[i])) return 1;
+    const char *sep = strstr(want, "://");
+    if (!sep || !m->has_host) return 0;   /* includes Origin: null */
+    char scheme[8];
+    size_t sl = (size_t)(sep - want);
+    if (sl == 0 || sl >= sizeof scheme) return 0;
+    memcpy(scheme, want, sl); scheme[sl] = 0;
+    str_lower(scheme);
+    if (strcmp(scheme, "http") != 0 && strcmp(scheme, "https") != 0) return 0;
+    char a[300], b[300];
+    if (origin_authority(scheme, sep + 3, a, sizeof a) != 0) return 0;
+    if (origin_authority(scheme, m->host, b, sizeof b) != 0) return 0;
+    return strcmp(a, b) == 0;
+}
+
+static int content_type_is_json(const char *ct) {
+    char media[128];
+    size_t n = strcspn(ct, ";");
+    while (n > 0 && (ct[n - 1] == ' ' || ct[n - 1] == '\t')) n--;
+    if (n >= sizeof media) return 0;
+    memcpy(media, ct, n); media[n] = 0;
+    return str_ieq(media, "application/json");
+}
+
+/* 0 = go ahead, otherwise an HTTP status has been queued on c. */
+static int request_rejected(Conn *c, const HttpRequestMeta *m) {
+    if (m->has_host && !host_allowed(m->host)) {
+        log_v("refused Host: %s", m->host);
+        http_send_error(c, 403, "host not allowed (start microspool with -H <name> to allow it)");
+        return 403;
+    }
+    int safe_method = str_ieq(m->method, "GET") || str_ieq(m->method, "HEAD");
+    if ((m->is_ws_upgrade || !safe_method) && !origin_allowed(m)) {
+        log_v("refused Origin: %s", m->origin);
+        http_send_error(c, 403, "origin not allowed (start microspool with -o <origin> to allow it)");
+        return 403;
+    }
+    int has_body = m->has_content_length && m->content_length > 0;
+    int body_method = str_ieq(m->method, "POST") || str_ieq(m->method, "PATCH") || str_ieq(m->method, "PUT");
+    if (body_method && has_body && !content_type_is_json(m->content_type)) {
+        http_send_error(c, 415, "Content-Type must be application/json");
+        return 415;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Обработка входящих байт на HTTP-соединении                               */
 /* ------------------------------------------------------------------------ */
 
@@ -2110,6 +2279,12 @@ static void process_http_buffer(Conn *c) {
         HttpRequestMeta meta;
         if (parse_http_request_line_and_headers(c->rx, hdr_len, &meta) != 0) {
             http_send_error(c, 400, "malformed request");
+            c->state = CS_HTTP_CLOSING;
+            conn_try_flush(c);
+            return;
+        }
+
+        if (request_rejected(c, &meta)) {
             c->state = CS_HTTP_CLOSING;
             conn_try_flush(c);
             return;
@@ -2335,7 +2510,14 @@ static void accept_clients(int lfd) {
 static void on_term_signal(int sig) { (void)sig; g_should_exit = 1; }
 
 static void print_usage(const char *argv0) {
-    fprintf(stderr, "usage: %s [-l addr] [-p port] [-d datafile] [-v] [-V] [-U]\n", argv0);
+    fprintf(stderr,
+        "usage: %s [-l addr] [-p port] [-d datafile] [-k ping_s] [-H host]... [-o origin]... [-v] [-V] [-U]\n"
+        "  -k  websocket ping interval in seconds (default %d, 0 = off); silent peers are\n"
+        "      closed after %d intervals\n"
+        "  -H  extra Host name to accept besides IP literals, localhost, the hostname and\n"
+        "      hostname.local (repeatable; '*' accepts any Host)\n"
+        "  -o  extra browser Origin allowed to write and open websockets, e.g.\n"
+        "      http://printer.lan (repeatable)\n", argv0, WS_PING_INTERVAL_S, WS_TIMEOUT_PINGS);
 }
 
 int main(int argc, char **argv) {
@@ -2344,6 +2526,16 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) g_listen_port = atoi(argv[++i]);
         else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) g_data_path = argv[++i];
         else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) g_ws_ping_interval = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-H") == 0 && i + 1 < argc) {
+            const char *h = argv[++i];
+            if (strcmp(h, "*") == 0) g_allow_any_host = 1;
+            else if (g_allow_hosts_n < MAX_ALLOW_NAMES) g_allow_hosts[g_allow_hosts_n++] = h;
+            else { fprintf(stderr, "microspool: too many -H names (max %d)\n", MAX_ALLOW_NAMES); return 1; }
+        }
+        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+            if (g_allow_origins_n < MAX_ALLOW_NAMES) g_allow_origins[g_allow_origins_n++] = argv[++i];
+            else { fprintf(stderr, "microspool: too many -o origins (max %d)\n", MAX_ALLOW_NAMES); return 1; }
+        }
         else if (strcmp(argv[i], "-v") == 0) g_verbose = 1;
         else if (strcmp(argv[i], "-U") == 0) g_ui_enabled = 0;
         else if (strcmp(argv[i], "-V") == 0 || strcmp(argv[i], "--version") == 0) {
@@ -2352,6 +2544,10 @@ int main(int argc, char **argv) {
         }
         else { print_usage(argv[0]); return 1; }
     }
+
+    if (gethostname(g_hostname, sizeof g_hostname - 1) != 0) g_hostname[0] = 0;
+    g_hostname[sizeof g_hostname - 1] = 0;
+    str_lower(g_hostname);
 
     if (load_data() != 0) {
         fprintf(stderr, "microspool: файл данных повреждён, выхожу без изменений\n");

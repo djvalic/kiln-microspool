@@ -134,10 +134,10 @@ def http_json(base, method, path, body=None, headers=None):
         return e.code, j, dict(e.headers)
 
 
-def raw_http(port, method, path, headers, body=b"", read_timeout=3.0):
+def raw_http(port, method, path, headers, body=b"", read_timeout=3.0, host="127.0.0.1"):
     """Полностью ручной HTTP-запрос — для тестов 411/413/некорректных заголовков."""
     s = socket.create_connection(("127.0.0.1", port), timeout=read_timeout)
-    lines = [f"{method} {path} HTTP/1.1", "Host: 127.0.0.1"]
+    lines = [f"{method} {path} HTTP/1.1"] + ([f"Host: {host}"] if host is not None else [])
     for k, v in headers.items():
         lines.append(f"{k}: {v}")
     lines.append("")
@@ -399,6 +399,113 @@ def test_ui():
 
         status, _, _ = http_json(srv.base_url(), "POST", "/")
         check("ui: POST / -> 405", status == 405)
+    finally:
+        srv.cleanup()
+
+
+def test_ui_security_headers():
+    import base64
+    import hashlib
+    srv = Server()
+    try:
+        srv.start()
+        raw = raw_http(srv.port, "GET", "/", {"Accept-Encoding": "gzip"})
+        head = raw.partition(b"\r\n\r\n")[0].decode(errors="replace")
+        hdrs = {}
+        for line in head.split("\r\n")[1:]:
+            k, _, v = line.partition(":")
+            hdrs[k.strip().lower()] = v.strip()
+        csp = hdrs.get("content-security-policy", "")
+        check("ui: X-Content-Type-Options: nosniff", hdrs.get("x-content-type-options") == "nosniff", head)
+        check("ui: X-Frame-Options: DENY", hdrs.get("x-frame-options") == "DENY", head)
+        ui_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "index.html")
+        with open(ui_path, "r", encoding="utf-8") as f:
+            script = re.search(r"<script>(.*?)</script>", f.read(), re.S).group(1)
+        h = "'sha256-" + base64.b64encode(hashlib.sha256(script.encode()).digest()).decode() + "'"
+        check("ui: CSP allows exactly the inline script by hash", f"script-src {h};" in csp, csp)
+        check("ui: CSP default-src 'none', frame-ancestors 'none'",
+              "default-src 'none'" in csp and "frame-ancestors 'none'" in csp, csp)
+        check("ui: CSP connect-src allows Moonraker (http://<host>:7125)",
+              re.search(r"connect-src [^;]*\bhttp:", csp) is not None, csp)
+        check("ui: CSP has no 'unsafe-inline' or 'unsafe-eval' for scripts",
+              "unsafe-eval" not in csp and "'unsafe-inline'" not in csp.split("script-src")[1].split(";")[0], csp)
+        status, _, hdrs2 = http_json(srv.base_url(), "GET", "/api/v1/health")
+        check("api: JSON responses carry nosniff", hdrs2.get("X-Content-Type-Options") == "nosniff", hdrs2)
+    finally:
+        srv.cleanup()
+
+
+def test_host_origin_content_type():
+    srv = Server()
+    try:
+        srv.start(extra_args=["-H", "printer.lan", "-o", "http://fluidd.lan"])
+        port = srv.port
+        hn = socket.gethostname().lower()
+
+        def st(host, method="GET", path="/api/v1/health", headers=None, body=b""):
+            h = dict(headers or {})
+            if body:
+                h.setdefault("Content-Length", str(len(body)))
+            return parse_status(raw_http(port, method, path, h, body=body, host=host))
+
+        check("host: 127.0.0.1:port accepted (what Moonraker sends)", st(f"127.0.0.1:{port}") == 200)
+        check("host: LAN IP literal accepted", st("192.168.1.56:7912") == 200)
+        check("host: [::1] literal accepted", st(f"[::1]:{port}") == 200)
+        check("host: localhost accepted", st(f"localhost:{port}") == 200)
+        check("host: machine hostname accepted", st(f"{hn}:{port}") == 200, hn)
+        check("host: hostname.local accepted", st(f"{hn}.local") == 200)
+        check("host: -H name accepted", st("Printer.LAN.") == 200)
+        check("host: missing Host header accepted (non-browser HTTP/1.0 style)", st(None) == 200)
+        check("host: foreign name -> 403 (DNS rebinding)", st("evil.example") == 403)
+        check("host: hostname as a prefix of another name -> 403", st(f"{hn}.evil.example") == 403)
+        check("host: junk port -> 403", st("127.0.0.1:abc") == 403)
+
+        vend = json.dumps({"name": "OriginTest"}).encode()
+        jh = {"Content-Type": "application/json"}
+        check("origin: none (Moonraker) -> POST 200", st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", jh, vend) == 200)
+        check("origin: same origin as Host -> POST 200",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": f"http://127.0.0.1:{port}"}, vend) == 200)
+        check("origin: default port normalised (http://a == a:80)",
+              st("192.168.1.56", "POST", "/api/v1/vendor", {**jh, "Origin": "http://192.168.1.56:80"}, vend) == 200)
+        check("origin: foreign page -> POST 403",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": "http://evil.example"}, vend) == 403)
+        check("origin: same host, other port -> 403",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": "http://127.0.0.1:1"}, vend) == 403)
+        check("origin: 'null' -> 403",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": "null"}, vend) == 403)
+        check("origin: foreign page -> DELETE 403",
+              st(f"127.0.0.1:{port}", "DELETE", "/api/v1/vendor/1", {"Origin": "http://evil.example"}) == 403)
+        check("origin: -o allowlisted origin -> POST 200",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": "http://fluidd.lan/"}, vend) == 200)
+        check("origin: GET with foreign Origin still answered (browser keeps it unreadable)",
+              st(f"127.0.0.1:{port}", "GET", "/api/v1/vendor", {"Origin": "http://evil.example"}) == 200)
+
+        def ws_status(headers, host=f"127.0.0.1:{port}"):
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            try:
+                return ws_handshake(s, headers=headers, host=host)[0]
+            finally:
+                s.close()
+        check("ws origin: no Origin (Moonraker/tornado) -> 101", ws_status({}) == 101)
+        check("ws origin: same origin -> 101", ws_status({"Origin": f"http://127.0.0.1:{port}"}) == 101)
+        check("ws origin: foreign page -> 403", ws_status({"Origin": "http://evil.example"}) == 403)
+        check("ws host: foreign Host -> 403", ws_status({}, host="evil.example") == 403)
+
+        status, before, _ = http_json(srv.base_url(), "GET", "/api/v1/vendor")
+        check("content-type: text/plain JSON POST -> 415",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {"Content-Type": "text/plain"}, vend) == 415)
+        check("content-type: form POST -> 415",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor",
+                 {"Content-Type": "application/x-www-form-urlencoded"}, b"name=x") == 415)
+        check("content-type: body without Content-Type -> 415",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {}, vend) == 415)
+        check("content-type: PATCH text/plain -> 415",
+              st(f"127.0.0.1:{port}", "PATCH", "/api/v1/vendor/1", {"Content-Type": "text/plain"}, b'{"name":"y"}') == 415)
+        status, after, _ = http_json(srv.base_url(), "GET", "/api/v1/vendor")
+        check("content-type: refused requests created nothing", len(before) == len(after))
+        check("content-type: application/json; charset=utf-8 accepted",
+              st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor",
+                 {"Content-Type": "Application/JSON; charset=utf-8"}, vend) == 200)
     finally:
         srv.cleanup()
 
@@ -978,6 +1085,8 @@ def main():
 
     test_ui()
     test_ui_disabled()
+    test_ui_security_headers()
+    test_host_origin_content_type()
     test_ui_js_syntax()
     test_settings_and_lists()
     test_persistence()
