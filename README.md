@@ -30,14 +30,18 @@ for printers without one.
 
 ## Install
 
-Until it is in the catalog, from the printer's console (Fluidd) or SSH:
+Until it is in the Kiln OS catalog, clone it once over SSH, as user
+`klipper` so Fluidd's Software Updates can keep it up to date:
 
 ```
-cd /data/ad5x/plugins && git clone https://github.com/djvalic/kiln-microspool.git microspool
+cd /data/ad5x/plugins
+su klipper -s /bin/sh -c 'git clone https://github.com/djvalic/kiln-microspool.git microspool'
 ```
 
-then `ENABLE_PLUGIN NAME=microspool` (or Settings > Plugins on the touch
-screen). Moonraker restarts and starts microspool.
+Then switch it on: Settings > Plugins on the touch screen, or
+`ENABLE_PLUGIN NAME=microspool` in Fluidd's console. Moonraker restarts
+(a few seconds) and starts microspool; Fluidd then lists kiln-microspool
+under Software Updates.
 
 With IFS slots: also enable kiln-spoolman (`spoolman` in the catalog) and
 link each slot to its spool (`SPOOLMAN_SET_SLOT SLOT=1 SPOOL=3`, or the
