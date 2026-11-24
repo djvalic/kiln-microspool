@@ -1,5 +1,19 @@
 # Changelog
 
+## kiln-microspool 0.1.1 (Kiln OS plugin)
+
+- On a printer with the IFS, Fluidd shows a reminder to also install Spoolman (kiln-spoolman) as
+  long as it is off: without it Moonraker can't tell which slot's spool a print used.
+- When your own `moonraker.conf` names another `[spoolman] server:`, Fluidd shows a warning: the
+  plugin's `[spoolman]` replaces it while the plugin is on.
+- README: the IFS section, the warning, and installing as user `klipper` over SSH.
+
+## kiln-microspool 0.1.0 (Kiln OS plugin)
+
+- The Kiln OS plugin around microspool: a Moonraker component starts it as user `klipper` (low
+  priority, first in line if memory runs out), restarts it if it stops and stops it with Moonraker;
+  `[spoolman]` points at it; `bin/microspool` built with Kiln OS's toolchain.
+
 ## 0.2.1-kiln1 (unreleased): hardening for Kiln OS
 
 Fork of microspool 0.2.1 for Kiln OS, where the web UI is reachable on the LAN without a login.

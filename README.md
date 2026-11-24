@@ -17,6 +17,22 @@ for printers without one.
 
 **Status: in development, not in the Kiln OS catalog yet.**
 
+## With the IFS: also install Spoolman (kiln-spoolman)
+
+microspool keeps the inventory; Moonraker takes each print's filament off
+the *active* spool. With the IFS, the active spool has to follow the slot
+in use, and that is what [kiln-spoolman](https://github.com/djvalic/kiln-spoolman)
+does (`spoolman` in the Kiln OS catalog): install it from Settings >
+Plugins on the touch screen (or `INSTALL_PLUGIN NAME=spoolman ENABLE=1`),
+then link each slot to its spool (the slot's spool picker on the touch
+screen, or `SPOOLMAN_SET_SLOT SLOT=1 SPOOL=3`). Each print then counts
+against the spool in the slot it used, and a linked slot takes its spool's
+material and colour.
+
+Without kiln-spoolman, microspool still works: pick the active spool in
+Fluidd or on the touch screen, as on a printer with one spool. On a printer
+with the IFS, Fluidd shows a reminder until kiln-spoolman is on.
+
 ## What you get
 
 - Fluidd's spool panel, HelixScreen's Spoolman screens and kiln-spoolman's
@@ -62,6 +78,10 @@ In your `moonraker.conf`, a `[microspool]` section of your own changes these
 
 `GET /server/microspool/status` shows whether it runs, its restarts and
 the last error.
+
+If your own `moonraker.conf` already has a `[spoolman] server:` (Spoolman on
+another computer), the plugin's `[spoolman]` replaces it while the plugin is
+on, and Fluidd shows a warning saying so. Use one or the other.
 
 ## Security
 

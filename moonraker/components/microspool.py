@@ -18,6 +18,12 @@
 #
 # Endpoint: GET /server/microspool/status
 #
+# Warnings (Fluidd shows Moonraker's warnings in its notifications):
+# - the printer has the IFS but kiln-spoolman ("spoolman" in the catalog)
+#   is off, so Moonraker can't tell which slot's spool a print uses;
+# - your own moonraker.conf names another [spoolman] server, which this
+#   plugin's [spoolman] replaces while it is on.
+#
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 from __future__ import annotations
@@ -70,15 +76,58 @@ class Microspool:
         self.restarts = 0
         self.last_exit: Optional[int] = None
         self.last_error = ""
+        self.data_path = data_path
         self.server.register_endpoint(
             "/server/microspool/status", ["GET"], self._handle_status)
+        self.server.register_event_handler(
+            "server:klippy_ready", self._on_klippy_ready)
 
     def _command(self) -> List[str]:
         return [self.binary, "-l", self.host, "-p", str(self.port),
                 "-d", self.data_file] + self.extra_args
 
     async def component_init(self) -> None:
+        self._check_own_spoolman()
         self.task = asyncio.create_task(self._supervise())
+
+    def _check_own_spoolman(self) -> None:
+        # The user's own moonraker.conf (printer_data/config), read as text:
+        # Moonraker's merged config only shows the plugin's value
+        if not self.data_path:
+            return
+        path = os.path.join(self.data_path, "config", "moonraker.conf")
+        server = own_spoolman_server(path)
+        if server is None:
+            return
+        mine = ("127.0.0.1:%d" % self.port, "localhost:%d" % self.port)
+        bare = server.split("://", 1)[-1].rstrip("/")
+        if bare in mine:
+            return
+        self.server.add_warning(
+            "kiln-microspool: your moonraker.conf has [spoolman] server: "
+            "%s. While the microspool plugin is on, Moonraker uses "
+            "microspool on this printer instead. Use one or the other: "
+            "switch the plugin off (DISABLE_PLUGIN NAME=microspool) to go "
+            "back to %s, or remove that [spoolman] section." % (
+                server, server), warn_id="microspool_own_spoolman")
+
+    async def _on_klippy_ready(self) -> None:
+        klippy_apis = self.server.lookup_component("klippy_apis")
+        try:
+            objects = await klippy_apis.get_object_list()
+        except Exception:
+            return
+        if "ifs" in objects and "spoolman_slots" not in objects:
+            self.server.add_warning(
+                "kiln-microspool: this printer has the IFS. To take each "
+                "print's filament off the spool in its own slot, also "
+                "install Spoolman (Settings > Plugins on the touch screen, "
+                "or INSTALL_PLUGIN NAME=spoolman ENABLE=1) and link each "
+                "slot to its spool.", warn_id="microspool_ifs_slots",
+                log=False)
+            logging.info("microspool: IFS without kiln-spoolman: notice shown")
+        else:
+            self.server.remove_warning("microspool_ifs_slots")
 
     def _prepare(self) -> bool:
         if not os.access(self.binary, os.X_OK):
@@ -190,6 +239,28 @@ class Microspool:
                 await proc.wait()
         if self.task is not None:
             self.task.cancel()
+
+
+def own_spoolman_server(path: str) -> Optional[str]:
+    # "server:" of a [spoolman] section in one config file, or None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    section = ""
+    for line in lines:
+        text = line.split("#", 1)[0].strip()
+        if not text:
+            continue
+        if text.startswith("[") and text.endswith("]"):
+            section = text[1:-1].strip().lower()
+            continue
+        if section == "spoolman" and ":" in text:
+            key, value = text.split(":", 1)
+            if key.strip().lower() == "server" and value.strip():
+                return value.strip()
+    return None
 
 
 def load_component(config: ConfigHelper) -> Microspool:
