@@ -1,50 +1,88 @@
-# microspool
+# kiln-microspool
 
-Track your 3D printing filament spools — material, colour and grams left — **on the printer itself**.
-microspool speaks the [Spoolman](https://github.com/Donkie/Spoolman) REST API, so Moonraker subtracts
-filament usage while you print and Fluidd, Mainsail and HelixScreen show your spools as usual.
+A spool inventory that runs on the printer itself: material, colour, brand
+and grams left for each spool. A Kiln OS plugin around
+[microspool](https://github.com/sntgl/microspool) by sntgl, a small server
+that speaks the [Spoolman](https://github.com/Donkie/Spoolman) API, so
+Moonraker counts the filament each print uses and Fluidd, HelixScreen and
+[kiln-spoolman](https://github.com/djvalic/kiln-spoolman) work with it the
+way they work with Spoolman.
 
-A single static C binary: **~106 KB on disk, ~0.2 MB RAM**. No Python, no database, no second host.
-That is the point: a printer like the FlashForge Adventurer 5M running
-[Z-Mod](https://github.com/ghzserg/zmod) has 128 MB of RAM for Klipper, Moonraker and the touchscreen —
-nothing left over for a filament inventory service, so this one had to be tiny.
+Real Spoolman needs far more memory than a Kiln OS printer can spare
+(about 60-100 MB on the printer, with a part in Rust that isn't built for
+its MIPS processor). microspool is one small program: about 130 KB, well
+under 1 MB of memory. If you already run Spoolman on another computer,
+keep using that instead (Moonraker's `[spoolman] server:`); this plugin is
+for printers without one.
 
-It implements the part of the Spoolman API that Moonraker and the interfaces actually call:
-`vendor` / `filament` / `spool` CRUD, `spool/{id}/use`, `info`, `health`, materials / locations /
-lot numbers and the `/api/v1/spool` WebSocket. The inventory lives in one JSON file. A built-in web UI
-(~8 KB gzipped) is served at `http://<host>:7912/` when started with `-l 0.0.0.0` — there is no auth, so
-keep it on a trusted network; `-U` disables it. No SpoolmanDB mirror, no multi-printer inventory: if your
-host can run Spoolman, run Spoolman. Independent project, not affiliated with it.
+**Status: in development, not in the Kiln OS catalog yet.**
 
-## Status
+## What you get
 
-- Moonraker `[spoolman]` — tested on a real AD5M (connection, proxy, usage reports).
-- HelixScreen — should work (same API calls), on-device check pending.
-- Fluidd — tested on a real printer (spool panel, spool selection). Mainsail — not tested.
-- Fluidd's “Manage spools” button opens the built-in UI even with `server: http://127.0.0.1:7912` —
-  it swaps a loopback host for the printer's address. Keep the loopback setting; only the UI port is on the LAN.
+- Fluidd's spool panel, HelixScreen's Spoolman screens and kiln-spoolman's
+  IFS slot links, with the usage of every print taken off the spool.
+- A web page for the inventory at `http://<printer>:7912` (Fluidd's
+  "Manage spools" opens it): add vendors, filaments and spools, set grams
+  left, archive empty spools.
+- The data in one file, `/home/klipper/printer_data/microspool/microspool.json`
+  (on the data partition, kept by Kiln OS updates), with the previous
+  version next to it as `microspool.json.bak`.
 
-## Build
+## Install
 
-```sh
-make release   # build/microspool-{armv7,aarch64,x86_64}, static musl (needs zig)
-make test      # needs uv
+Until it is in the catalog, from the printer's console (Fluidd) or SSH:
+
+```
+cd /data/ad5x/plugins && git clone https://github.com/djvalic/kiln-microspool.git microspool
 ```
 
-## Use
+then `ENABLE_PLUGIN NAME=microspool` (or Settings > Plugins on the touch
+screen). Moonraker restarts and starts microspool.
 
-```sh
-microspool -l 127.0.0.1 -p 7912 -d microspool.json
-```
+With IFS slots: also enable kiln-spoolman (`spoolman` in the catalog) and
+link each slot to its spool (`SPOOLMAN_SET_SLOT SLOT=1 SPOOL=3`, or the
+slot's spool picker on the touch screen).
 
-```ini
-# moonraker.conf
-[spoolman]
-server: http://127.0.0.1:7912
-```
+## Settings
 
-AD5M / Z-Mod install: [contrib/zmod/INSTALL.md](contrib/zmod/INSTALL.md).
+In your `moonraker.conf`, a `[microspool]` section of your own changes these
+(the plugin's section comes after yours, so set only what you change):
 
-## License
+| Option | Default | |
+|---|---|---|
+| `host` | `0.0.0.0` | `127.0.0.1` keeps the web page off the network; Fluidd's and HelixScreen's spool panels still work |
+| `port` | `7912` | |
+| `data_file` | `/home/klipper/printer_data/microspool/microspool.json` | |
+| `binary` | the plugin's `bin/microspool` | |
+| `extra_args` | | more microspool options |
 
-MIT. Bundles [cJSON](https://github.com/DaveGamble/cJSON) (MIT).
+`GET /server/microspool/status` shows whether it runs, its restarts and
+the last error.
+
+## Security
+
+Like Fluidd on Kiln OS, the web page has no login: anyone on your network
+can change the inventory (nothing else; it can't reach files or run
+anything). Kiln's fork limits connections, sizes and time per client, and
+refuses requests from other web sites, so a device or a web page on the
+network can't lock Moonraker out of it. Use `host: 127.0.0.1` if your
+network isn't trusted.
+
+## How it runs
+
+The plugin's Moonraker component starts `bin/microspool` as user
+`klipper`, at low priority and first in line if memory runs out, restarts
+it if it stops, and stops it (it saves first) when Moonraker stops or the
+plugin is switched off.
+
+`bin/microspool` is built from this repository's source with Kiln OS's own
+toolchain (`tools/build_mipsel.sh`; `bin/SOURCES` says from which commit).
+
+## Licence and credits
+
+- microspool (`microspool.c`, `ui/`, `tools/embed_ui.py`, the tests):
+  MIT, by sntgl (`LICENSE`); its own README is `README-microspool.md`.
+  Kiln's changes are listed in `CHANGELOG.md`.
+- cJSON (`vendor/`): MIT, Dave Gamble and contributors.
+- The Moonraker component (`moonraker/components/microspool.py`): GPLv3,
+  like Moonraker.

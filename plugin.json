@@ -1,0 +1,10 @@
+{
+  "name": "microspool",
+  "description": "Spool inventory on the printer: microspool, a small Spoolman-compatible server (web page on port 7912)",
+  "version": "0.1.0",
+  "author": "djvalic (microspool by sntgl)",
+  "url": "https://github.com/djvalic/kiln-microspool",
+  "requires_os": "1.4",
+  "requires": [],
+  "conflicts": []
+}
