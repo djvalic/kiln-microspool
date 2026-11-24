@@ -54,7 +54,12 @@ class Microspool:
         self.server = config.get_server()
         self.host = config.get("host", "0.0.0.0")
         self.port = config.getint("port", 7912, minval=1, maxval=65535)
-        self.data_file = config.get("data_file", DEFAULT_DATA)
+        # Default: printer_data/microspool/ (Moonraker's data path, which is
+        # /home/klipper/printer_data on Kiln OS)
+        data_path = self.server.get_app_args().get("data_path", "")
+        default_data = (os.path.join(data_path, "microspool", "microspool.json")
+                        if data_path else DEFAULT_DATA)
+        self.data_file = config.get("data_file", default_data)
         self.binary = config.get(
             "binary", os.path.join(PLUGIN_DIR, "bin", "microspool"))
         self.extra_args = shlex.split(config.get("extra_args", ""))

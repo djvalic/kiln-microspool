@@ -1,0 +1,4 @@
+bin/microspool: microspool 0.2.1 (kiln-microspool 0.1.0)
+source: this repository at 024dbf5c6a651cd5048e738b077f6cc8ef7f7469
+compiler: mipsel-buildroot-linux-gnu-gcc.br_real (Buildroot 2026.02.3) 14.3.0
+sha256: bd3819b6ff87bd52dced63db069693d409dc812e7f754d96be52cac90735b503
