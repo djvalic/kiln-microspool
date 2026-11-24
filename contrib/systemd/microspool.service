@@ -8,6 +8,8 @@ Before=moonraker.service
 [Service]
 User=pi
 ExecStart=/usr/local/bin/microspool -l 127.0.0.1 -p 7912 -d /home/pi/printer_data/microspool.json
+# reload = save pending usage reports now
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 Nice=10
 

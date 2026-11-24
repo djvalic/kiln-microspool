@@ -45,6 +45,28 @@ server: http://127.0.0.1:7912
 
 AD5M / Z-Mod install: [contrib/zmod/INSTALL.md](contrib/zmod/INSTALL.md).
 
+### On the LAN (`-l 0.0.0.0`)
+
+There is still no login, but hostile LAN clients and web pages are kept in check:
+
+- Local clients (127.0.0.1 or the machine's own address, i.e. Moonraker) always get a connection slot;
+  LAN clients share 28 of the 32, at most 8 per address and 4 websockets.
+- Each HTTP request must arrive and be answered within 10 s; websockets silent for 3 ping intervals
+  (`-k`, default 20 s) are closed; a client that does not read its websocket is dropped.
+- The `Host` header must be an IP address, `localhost`, the machine's hostname or `<hostname>.local`
+  (DNS rebinding). Allow other names with `-H name` (repeatable, `-H '*'` allows any).
+- Writes and websockets from a browser must come from the same origin as the page; allow another origin
+  with `-o http://name[:port]`. Clients without an `Origin` header (Moonraker, curl) are not affected.
+- Request bodies must be `Content-Type: application/json`, valid UTF-8, finite numbers.
+- LAN clients can save at most about once per second after a burst of 5 writes.
+
+### Data file
+
+Create/patch/delete answer only after the change is on disk (500 and nothing changed if the write fails).
+Usage reports are written within 5 s, on `SIGHUP` and on exit. The previous version is kept as
+`<datafile>.bak`; if the main file is damaged, microspool starts from the `.bak`, keeps the damaged file as
+`<datafile>.corrupt` and says so loudly in its log. If both are damaged it refuses to start.
+
 ## License
 
 MIT. Bundles [cJSON](https://github.com/DaveGamble/cJSON) (MIT).

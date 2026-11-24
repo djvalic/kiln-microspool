@@ -14,6 +14,15 @@ WebSocket через tornado (ping/pong живучесть, событие delet
 AsyncHTTPClient), лимит соединений и отсутствие утечки RSS на 2000 запросах,
 встроенный веб-интерфейс (gzip / 406 / -U), /api/v1/setting/currency,
 /api/v1/material, /api/v1/location, /api/v1/lot-number.
+
+Kiln OS hardening: LAN connection pool and loopback reservation (LAN clients
+are simulated from 127.0.0.2..7), slowloris deadline, websocket ping interval
+and silence timeout, non-reading websocket client, Host/Origin/Content-Type
+checks, UI security headers and CSP, UTF-8 and number validation, data file
+id checks, .bak fallback, temp files, failed save -> 500 and rollback
+(read-only directory; skipped as root), 5 s deferred flush and SIGHUP, LAN
+write rate limit, field/external endpoints, limit/offset/vendor.id and
+websocket subscription paths.
 """
 import asyncio
 import gzip
