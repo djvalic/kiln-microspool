@@ -611,7 +611,7 @@ def test_host_origin_content_type():
             return parse_status(raw_http(port, method, path, h, body=body, host=host))
 
         check("host: 127.0.0.1:port accepted (what Moonraker sends)", st(f"127.0.0.1:{port}") == 200)
-        check("host: LAN IP literal accepted", st("192.168.1.56:7912") == 200)
+        check("host: LAN IP literal accepted", st("192.0.2.56:7912") == 200)
         check("host: [::1] literal accepted", st(f"[::1]:{port}") == 200)
         check("host: localhost accepted", st(f"localhost:{port}") == 200)
         check("host: machine hostname accepted", st(f"{hn}:{port}") == 200, hn)
@@ -628,7 +628,7 @@ def test_host_origin_content_type():
         check("origin: same origin as Host -> POST 200",
               st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": f"http://127.0.0.1:{port}"}, vend) == 200)
         check("origin: default port normalised (http://a == a:80)",
-              st("192.168.1.56", "POST", "/api/v1/vendor", {**jh, "Origin": "http://192.168.1.56:80"}, vend) == 200)
+              st("192.0.2.56", "POST", "/api/v1/vendor", {**jh, "Origin": "http://192.0.2.56:80"}, vend) == 200)
         check("origin: foreign page -> POST 403",
               st(f"127.0.0.1:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": "http://evil.example"}, vend) == 403)
         check("origin: same host, other port -> 403",

@@ -92,8 +92,8 @@ def main():
         cases = [
             ("", None),
             ("[server]\nport: 7125\n", None),
-            ("[spoolman]\nserver: http://192.168.1.5:7912\n",
-             "http://192.168.1.5:7912"),
+            ("[spoolman]\nserver: http://192.0.2.5:7912\n",
+             "http://192.0.2.5:7912"),
             ("[Spoolman]\n  server : http://nas:7912/  # comment\n",
              "http://nas:7912/"),
             ("[spoolman]\n# server: http://x:1\n", None),
@@ -126,10 +126,10 @@ def main():
           "microspool_ifs_slots" not in w)
     w = warnings_for(None, ["toolhead"])
     check("no IFS -> no IFS notice", "microspool_ifs_slots" not in w)
-    w = warnings_for("[spoolman]\nserver: http://192.168.1.5:7912\n", ["toolhead"])
+    w = warnings_for("[spoolman]\nserver: http://192.0.2.5:7912\n", ["toolhead"])
     check("own Spoolman elsewhere -> warning", "microspool_own_spoolman" in w)
     check("warning names that server",
-          "192.168.1.5:7912" in w.get("microspool_own_spoolman", ""))
+          "192.0.2.5:7912" in w.get("microspool_own_spoolman", ""))
     w = warnings_for("[spoolman]\nserver: http://127.0.0.1:7912\n", ["toolhead"])
     check("own [spoolman] pointing at microspool -> no warning",
           "microspool_own_spoolman" not in w)
