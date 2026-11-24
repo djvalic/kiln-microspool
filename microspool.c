@@ -50,11 +50,23 @@
 #define BODY_LIMIT      16384  /* тело запроса <= 16 КБ, иначе 413 */
 #define HEADER_LIMIT    8192   /* защита от неограниченного роста буфера заголовков */
 
-#define MAX_CONNS       8
-#define LISTEN_BACKLOG  16
+/* Connections. Moonraker keeps one websocket open all the time and makes short
+   HTTP requests; the web UI is reachable from the LAN without a login, so LAN
+   clients must never be able to take the slots Moonraker needs. */
+#define MAX_CONNS             32
+#define LOCAL_RESERVED_CONNS  4     /* slots LAN clients can never take */
+#define MAX_CONNS_PER_PEER    8     /* per LAN address */
+#define MAX_REMOTE_WS         4     /* websockets from LAN addresses, in total */
+#define EVICT_MIN_AGE_S       1.0   /* a LAN request still incomplete after this may be evicted */
+#define LISTEN_BACKLOG        32
 
-#define HTTP_IDLE_TIMEOUT_S   10
+#define HTTP_REQUEST_DEADLINE_S 10  /* accept -> response sent, whatever the client does (slowloris) */
 #define WS_PING_INTERVAL_S    20      /* по умолчанию; -k задаёт своё, -k 0 отключает пинги сервера */
+#define WS_TIMEOUT_PINGS      3     /* websocket closed after this many ping intervals without any byte from the peer */
+
+#define BUF_KEEP_CAP          16384             /* per-slot buffers up to this size are reused */
+#define WS_TX_LIMIT           (256 * 1024)      /* unsent bytes per websocket peer before it is dropped */
+#define TX_TOTAL_LIMIT        (8 * 1024 * 1024) /* all send buffers together */
 #define USE_FLUSH_INTERVAL_S  30
 
 /* Версия Spoolman API, которую мы изображаем в /api/v1/info (клиенты сверяют), и собственная версия. */
@@ -1440,6 +1452,13 @@ typedef struct {
     int in_use;
     conn_state_t state;
 
+    /* Who is on the other end. "Local" = 127.0.0.1 or the machine's own address
+       (Moonraker, HelixScreen, scripts on the printer); everything else counts as
+       a LAN client and is subject to the per-peer and pool limits below. */
+    int is_local;
+    struct in_addr peer;
+    double accepted_mono;     /* the HTTP deadline counts from here, not from the last byte */
+
     char *rx; size_t rx_len, rx_cap;
     size_t header_body_offset;
     long content_length;
@@ -1447,11 +1466,12 @@ typedef struct {
 
     char *tx; size_t tx_len, tx_cap, tx_sent;
     int close_after_flush;
-
-    double last_activity_mono;
+    int close_now;            /* drop without flushing (buffer cap hit, protocol error) */
+    int rd_eof;               /* peer shut down its sending side; stop polling POLLIN */
 
     int is_ws;
     double last_ping_sent_mono;
+    double last_rx_mono;      /* last byte from a websocket peer (pong, ping, anything) */
     int ws_state; /* 0=заголовок кадра, 1=payload управляющего кадра, 2=съедаем данные */
     unsigned char ws_hdrbuf[14];
     int ws_hdrlen;
@@ -1465,23 +1485,26 @@ typedef struct {
 
 static Conn g_conns[MAX_CONNS];
 
-/* Слот соединения переиспользуется многократно (см. MAX_CONNS). Буферы rx/tx
-   НЕ освобождаются при закрытии соединения — только их длины сбрасываются в 0,
-   а выделенная ёмкость остаётся для следующего клиента на этом слоте. Это
-   убирает churn malloc/free на потоке коротких HTTP-запросов (иначе на
-   встраиваемом musl-аллокаторе/macOS-аллокаторе RSS заметно растёт от
-   фрагментации, хотя утечки как таковой нет). Верхняя граница памяти всё
-   равно ограничена: MAX_CONNS слотов × (HEADER_LIMIT+BODY_LIMIT) в худшем
-   случае. */
-static void conn_reset(Conn *c) {
-    if (c->fd >= 0) close(c->fd);
+/* Слот соединения переиспользуется многократно (см. MAX_CONNS). Small rx/tx
+   buffers (up to BUF_KEEP_CAP) stay with the slot for the next client, which
+   avoids malloc/free churn on a stream of short HTTP requests (otherwise RSS
+   creeps up from fragmentation on small allocators). Anything bigger, e.g. after
+   a large spool list or a websocket burst, is freed, so idle memory stays at
+   MAX_CONNS × 2 × BUF_KEEP_CAP at most. */
+static void conn_clear_keep_buffers(Conn *c) {
+    if (c->rx_cap > BUF_KEEP_CAP) { free(c->rx); c->rx = NULL; c->rx_cap = 0; }
+    if (c->tx_cap > BUF_KEEP_CAP) { free(c->tx); c->tx = NULL; c->tx_cap = 0; }
     char *saved_rx = c->rx; size_t saved_rx_cap = c->rx_cap;
     char *saved_tx = c->tx; size_t saved_tx_cap = c->tx_cap;
     memset(c, 0, sizeof *c);
     c->fd = -1;
-    c->in_use = 0;
     c->rx = saved_rx; c->rx_cap = saved_rx_cap;
     c->tx = saved_tx; c->tx_cap = saved_tx_cap;
+}
+
+static void conn_reset(Conn *c) {
+    if (c->fd >= 0) close(c->fd);
+    conn_clear_keep_buffers(c);
 }
 
 static int conn_rx_reserve(Conn *c, size_t extra) {
@@ -1494,11 +1517,35 @@ static int conn_rx_reserve(Conn *c, size_t extra) {
     return 0;
 }
 
+/* Memory held by all send buffers except `except`'s. */
+static size_t tx_total_cap(const Conn *except) {
+    size_t total = 0;
+    for (int i = 0; i < MAX_CONNS; i++) if (&g_conns[i] != except) total += g_conns[i].tx_cap;
+    return total;
+}
+
+/* Queues bytes for sending. Fails (-1) instead of growing past the caps: a
+   websocket peer may have at most WS_TX_LIMIT unsent bytes queued (a client that
+   never reads cannot grow our memory via ping echoes or broadcasts), and all
+   send buffers together stay under TX_TOTAL_LIMIT. Callers drop the connection
+   or answer 503 on failure. */
 static int conn_tx_append(Conn *c, const void *data, size_t len) {
     if (len == 0) return 0;
+    size_t pending = c->tx_len - c->tx_sent;
+    size_t limit = c->is_ws ? WS_TX_LIMIT : TX_TOTAL_LIMIT;
+    if (len > limit || pending > limit - len) return -1;
+    if (c->tx_len + len > c->tx_cap && c->tx_sent > 0) {
+        /* reclaim the already-sent head before growing */
+        memmove(c->tx, c->tx + c->tx_sent, pending);
+        c->tx_len = pending;
+        c->tx_sent = 0;
+    }
     if (c->tx_len + len > c->tx_cap) {
+        size_t need = c->tx_len + len;
         size_t newcap = c->tx_cap ? c->tx_cap * 2 : 1024;
-        while (newcap < c->tx_len + len) newcap *= 2;
+        if (newcap < need) newcap = (need + 1023) & ~(size_t)1023;
+        if (newcap > TX_TOTAL_LIMIT) newcap = need;
+        if (tx_total_cap(c) + newcap > TX_TOTAL_LIMIT) return -1;
         char *n = realloc(c->tx, newcap);
         if (!n) return -1;
         c->tx = n; c->tx_cap = newcap;
@@ -1509,6 +1556,8 @@ static int conn_tx_append(Conn *c, const void *data, size_t len) {
 }
 
 static void conn_try_flush(Conn *c) {
+    if (!c->in_use) return;
+    if (c->close_now) { conn_reset(c); return; }
     while (c->tx_sent < c->tx_len) {
         ssize_t w = send(c->fd, c->tx + c->tx_sent, c->tx_len - c->tx_sent, 0);
         if (w > 0) { c->tx_sent += (size_t)w; continue; }
@@ -1518,8 +1567,9 @@ static void conn_try_flush(Conn *c) {
         return;
     }
     c->tx_len = 0; c->tx_sent = 0;
+    if (c->tx_cap > BUF_KEEP_CAP) { free(c->tx); c->tx = NULL; c->tx_cap = 0; }
     /* Ответ отправлен целиком. Мы всегда шлём `Connection: close`, поэтому закрываем сами, не дожидаясь
-       FIN от клиента: иначе слот держится до idle-таймаута (10 с) и на восьми подряд запросах сервер
+       FIN от клиента: иначе слот держится до таймаута, и на серии подряд идущих запросов сервер
        начинает отвергать новые соединения (ловилось в CI на Linux). */
     if (c->close_after_flush || c->state == CS_HTTP_CLOSING) { conn_reset(c); return; }
 }
@@ -1537,13 +1587,30 @@ static const char *status_text_for(int code) {
         case 405: return "Method Not Allowed";
         case 411: return "Length Required";
         case 413: return "Payload Too Large";
+        case 503: return "Service Unavailable";
         default:  return "Error";
     }
+}
+
+/* Queues one complete HTTP response (the send buffer is empty at this point).
+   If it does not fit under TX_TOTAL_LIMIT the client gets a short 503 instead,
+   and if even that does not fit, the connection is dropped. */
+static void http_queue_response(Conn *c, const char *head, size_t hn, const void *body, size_t blen) {
+    c->close_after_flush = 1;
+    if (conn_tx_append(c, head, hn) == 0 && conn_tx_append(c, body, blen) == 0) return;
+    c->tx_len = 0; c->tx_sent = 0;
+    static const char busy_body[] = "{\"message\":\"server busy, try again\"}";
+    char busy[256];
+    int n = snprintf(busy, sizeof busy,
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: %zu\r\n"
+        "Connection: close\r\n\r\n%s", sizeof busy_body - 1, busy_body);
+    if (n < 0 || (size_t)n >= sizeof busy || conn_tx_append(c, busy, (size_t)n) != 0) c->close_now = 1;
 }
 
 static void http_send_json(Conn *c, int status, cJSON *body_owned, int total_count) {
     char *json_text = body_owned ? cJSON_PrintUnformatted(body_owned) : NULL;
     if (body_owned) cJSON_Delete(body_owned);
+    if (body_owned && !json_text) status = 503;   /* out of memory while printing */
     size_t blen = json_text ? strlen(json_text) : 0;
     char head[512];
     int hn;
@@ -1556,10 +1623,8 @@ static void http_send_json(Conn *c, int status, cJSON *body_owned, int total_cou
             "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
             status, status_text_for(status), blen);
     }
-    conn_tx_append(c, head, (size_t)hn);
-    if (blen) conn_tx_append(c, json_text, blen);
+    http_queue_response(c, head, (size_t)hn, json_text, blen);
     free(json_text);
-    c->close_after_flush = 1;
 }
 
 static void http_send_error(Conn *c, int status, const char *msg) {
@@ -1572,7 +1637,9 @@ static void http_send_error(Conn *c, int status, const char *msg) {
 /* WebSocket: handshake, кадры, рассылка событий                            */
 /* ------------------------------------------------------------------------ */
 
-static void ws_send_frame(Conn *c, int opcode, const unsigned char *payload, size_t len) {
+/* Queues one frame; a peer whose unsent backlog would pass WS_TX_LIMIT is
+   marked for dropping (close_now) rather than buffered without bound. */
+static int ws_send_frame(Conn *c, int opcode, const unsigned char *payload, size_t len) {
     unsigned char hdr[10];
     size_t hn = 0;
     hdr[hn++] = (unsigned char)(0x80 | (opcode & 0x0F));
@@ -1587,8 +1654,12 @@ static void ws_send_frame(Conn *c, int opcode, const unsigned char *payload, siz
         /* uint64_t: with a 32-bit size_t (MIPS32, ARMv7) shifting by 32..56 bits is undefined */
         for (int i = 7; i >= 0; i--) hdr[hn++] = (unsigned char)((uint64_t)len >> (8 * i));
     }
-    conn_tx_append(c, hdr, hn);
-    if (len) conn_tx_append(c, payload, len);
+    if (len > WS_TX_LIMIT || conn_tx_append(c, hdr, hn) != 0 || conn_tx_append(c, payload, len) != 0) {
+        log_v("websocket peer too slow (%zu bytes unsent), dropping it", c->tx_len - c->tx_sent);
+        c->close_now = 1;
+        return -1;
+    }
+    return 0;
 }
 
 static void ws_send_handshake(Conn *c, const char *key) {
@@ -1598,12 +1669,12 @@ static void ws_send_handshake(Conn *c, const char *key) {
     int n = snprintf(head, sizeof head,
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
         accept);
-    conn_tx_append(c, head, (size_t)n);
     c->is_ws = 1;
     c->state = CS_WS;
     c->close_after_flush = 0;
+    if (n < 0 || (size_t)n >= sizeof head || conn_tx_append(c, head, (size_t)n) != 0) c->close_now = 1;
     c->last_ping_sent_mono = mono_now();
-    c->last_activity_mono = mono_now();
+    c->last_rx_mono = mono_now();
     c->ws_hdrlen = 0;
     c->ws_state = 0;
 }
@@ -1621,6 +1692,7 @@ static void ws_handle_ctrl_frame(Conn *c) {
 static void ws_feed(Conn *c, const unsigned char *data, size_t n) {
     size_t i = 0;
     while (i < n) {
+        if (c->close_now || c->close_after_flush) return;   /* closing: ignore the rest */
         if (c->ws_state == 0) {
             if (c->ws_hdrlen < 2) {
                 c->ws_hdrbuf[c->ws_hdrlen++] = data[i++];
@@ -1705,7 +1777,7 @@ static void ws_broadcast_event(const char *type, const char *resource, cJSON *pa
     if (!text) return;
     size_t len = strlen(text);
     for (int i = 0; i < MAX_CONNS; i++) {
-        if (g_conns[i].in_use && g_conns[i].is_ws) {
+        if (g_conns[i].in_use && g_conns[i].is_ws && !g_conns[i].close_after_flush) {
             ws_send_frame(&g_conns[i], 0x1, (const unsigned char *)text, len);
             conn_try_flush(&g_conns[i]);
         }
@@ -1833,9 +1905,7 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
             int hn = snprintf(head, sizeof head,
                 "HTTP/1.1 406 Not Acceptable\r\nContent-Type: text/plain; charset=utf-8\r\n"
                 "Content-Length: %zu\r\nConnection: close\r\n\r\n", sizeof msg - 1);
-            conn_tx_append(c, head, (size_t)hn);
-            conn_tx_append(c, msg, sizeof msg - 1);
-            c->close_after_flush = 1;
+            http_queue_response(c, head, (size_t)hn, msg, sizeof msg - 1);
             return;
         }
         char head[256];
@@ -1843,9 +1913,7 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n"
             "Content-Encoding: gzip\r\nCache-Control: no-cache\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
             UI_INDEX_GZ_LEN);
-        conn_tx_append(c, head, (size_t)hn);
-        conn_tx_append(c, UI_INDEX_GZ, UI_INDEX_GZ_LEN);
-        c->close_after_flush = 1;
+        http_queue_response(c, head, (size_t)hn, UI_INDEX_GZ, UI_INDEX_GZ_LEN);
         return;
     }
 
@@ -2050,6 +2118,21 @@ static void process_http_buffer(Conn *c) {
         char path_only[1024];
         split_path(meta.path, path_only, sizeof path_only);
         if (meta.is_ws_upgrade && str_ieq(meta.method, "GET") && strncmp(path_only, "/api/v1/", 8) == 0) {
+            int remote_ws = 0;
+            for (int i = 0; i < MAX_CONNS; i++)
+                if (g_conns[i].in_use && g_conns[i].is_ws && !g_conns[i].is_local) remote_ws++;
+            if (meta.ws_key[0] == 0) {
+                http_send_error(c, 400, "missing Sec-WebSocket-Key");
+                c->state = CS_HTTP_CLOSING;
+                conn_try_flush(c);
+                return;
+            }
+            if (!c->is_local && remote_ws >= MAX_REMOTE_WS) {
+                http_send_error(c, 503, "too many websocket clients");
+                c->state = CS_HTTP_CLOSING;
+                conn_try_flush(c);
+                return;
+            }
             ws_send_handshake(c, meta.ws_key);
             conn_try_flush(c);
             return;
@@ -2089,11 +2172,14 @@ static void conn_on_readable(Conn *c) {
     for (;;) {
         ssize_t r = recv(c->fd, buf, sizeof buf, 0);
         if (r > 0) {
-            c->last_activity_mono = mono_now();
             if (c->state == CS_WS) {
+                c->last_rx_mono = mono_now();
                 ws_feed(c, buf, (size_t)r);
                 conn_try_flush(c);
                 if (!c->in_use) return;
+            } else if (c->state == CS_HTTP_CLOSING) {
+                /* The request is complete and answered: read and drop whatever else
+                   arrives (bounded by the request deadline) instead of growing rx. */
             } else {
                 if (conn_rx_reserve(c, (size_t)r) != 0) { conn_reset(c); return; }
                 memcpy(c->rx + c->rx_len, buf, (size_t)r);
@@ -2108,6 +2194,10 @@ static void conn_on_readable(Conn *c) {
             }
             if ((size_t)r < sizeof buf) break;
         } else if (r == 0) {
+            if (c->state == CS_HTTP_CLOSING && c->tx_len > c->tx_sent) {
+                c->rd_eof = 1;   /* half-closed after the request: still deliver the answer */
+                return;
+            }
             conn_reset(c);
             return;
         } else {
@@ -2121,6 +2211,121 @@ static void conn_on_readable(Conn *c) {
 
 static void conn_on_writable(Conn *c) {
     conn_try_flush(c);
+}
+
+/* Next moment this connection needs attention (deadline, ping, timeout). */
+static double conn_next_deadline(const Conn *c) {
+    if (!c->in_use) return 1e300;
+    if (!c->is_ws) return c->accepted_mono + HTTP_REQUEST_DEADLINE_S;
+    if (g_ws_ping_interval <= 0) return 1e300;
+    double ping = c->last_ping_sent_mono + g_ws_ping_interval;
+    double dead = c->last_rx_mono + (double)WS_TIMEOUT_PINGS * g_ws_ping_interval;
+    return ping < dead ? ping : dead;
+}
+
+static void conn_run_timers(Conn *c, double now) {
+    if (!c->in_use) return;
+    if (!c->is_ws) {
+        /* One deadline from accept for headers, body and sending the answer;
+           trickling a byte at a time does not extend it (slowloris). */
+        if (now - c->accepted_mono >= HTTP_REQUEST_DEADLINE_S) {
+            log_v("request deadline passed, closing connection");
+            conn_reset(c);
+        }
+        return;
+    }
+    if (g_ws_ping_interval <= 0) return;   /* -k 0: no pings, so no idle timeout either */
+    if (now - c->last_rx_mono >= (double)WS_TIMEOUT_PINGS * g_ws_ping_interval) {
+        /* Tornado (Moonraker) answers every ping with a pong, so a live client
+           always sends something within one interval. */
+        log_v("websocket peer silent for %.0f s, closing", now - c->last_rx_mono);
+        conn_reset(c);
+        return;
+    }
+    if (now - c->last_ping_sent_mono >= g_ws_ping_interval) {
+        ws_send_frame(c, 0x9, NULL, 0);
+        c->last_ping_sent_mono = now;
+        conn_try_flush(c);
+    }
+}
+
+/* Oldest connection matching the filter that is a candidate for eviction. */
+static Conn *conn_pick_victim(int remote_only, int incomplete_only, double min_age, double now) {
+    Conn *victim = NULL;
+    for (int i = 0; i < MAX_CONNS; i++) {
+        Conn *c = &g_conns[i];
+        if (!c->in_use || c->is_ws) continue;
+        if (remote_only && c->is_local) continue;
+        if (incomplete_only && c->state != CS_HTTP_HEADERS && c->state != CS_HTTP_BODY) continue;
+        if (now - c->accepted_mono < min_age) continue;
+        if (!victim || c->accepted_mono < victim->accepted_mono) victim = c;
+    }
+    return victim;
+}
+
+/* Accepts all pending connections and decides who gets a slot:
+   - local peers (127.0.0.1 or the machine's own address) may use every slot and,
+     when all are taken, push out the oldest LAN HTTP connection;
+   - LAN peers share MAX_CONNS - LOCAL_RESERVED_CONNS slots, at most
+     MAX_CONNS_PER_PEER per address; when their pool is full, a new LAN client
+     evicts the oldest LAN connection that has not finished sending its request
+     within EVICT_MIN_AGE_S (slow or idle sockets), otherwise it is closed. */
+static void accept_clients(int lfd) {
+    for (;;) {
+        struct sockaddr_in cliaddr, locaddr;
+        socklen_t clilen = sizeof cliaddr, loclen = sizeof locaddr;
+        int cfd = accept(lfd, (struct sockaddr *)&cliaddr, &clilen);
+        if (cfd < 0) {
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            break;
+        }
+        int is_local = cliaddr.sin_addr.s_addr == htonl(INADDR_LOOPBACK);
+        if (!is_local && getsockname(cfd, (struct sockaddr *)&locaddr, &loclen) == 0 &&
+            locaddr.sin_addr.s_addr == cliaddr.sin_addr.s_addr) is_local = 1;
+
+        double now = mono_now();
+        int remote = 0, same_peer = 0, free_slot = -1;
+        for (int i = 0; i < MAX_CONNS; i++) {
+            if (!g_conns[i].in_use) { if (free_slot < 0) free_slot = i; continue; }
+            if (g_conns[i].is_local) continue;
+            remote++;
+            if (g_conns[i].peer.s_addr == cliaddr.sin_addr.s_addr) same_peer++;
+        }
+        Conn *victim = NULL;
+        if (!is_local) {
+            if (same_peer >= MAX_CONNS_PER_PEER) {
+                log_v("%s: too many connections from this address", inet_ntoa(cliaddr.sin_addr));
+                close(cfd);
+                continue;
+            }
+            if (remote >= MAX_CONNS - LOCAL_RESERVED_CONNS || free_slot < 0) {
+                victim = conn_pick_victim(1, 1, EVICT_MIN_AGE_S, now);
+                if (!victim) { log_v("LAN connection pool full, refusing"); close(cfd); continue; }
+            }
+        } else if (free_slot < 0) {
+            victim = conn_pick_victim(1, 0, 0, now);
+            if (!victim) { log_v("all connection slots taken by local clients, refusing"); close(cfd); continue; }
+        }
+        if (victim) {
+            log_v("evicting an old LAN connection to make room");
+            conn_reset(victim);
+            free_slot = (int)(victim - g_conns);
+        }
+
+        fcntl(cfd, F_SETFL, O_NONBLOCK);
+        fcntl(cfd, F_SETFD, FD_CLOEXEC);
+        int one = 1;
+        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        Conn *c = &g_conns[free_slot];
+        conn_clear_keep_buffers(c);   /* keeps the slot's small buffers (see above) */
+        c->fd = cfd;
+        c->in_use = 1;
+        c->is_local = is_local;
+        c->peer = cliaddr.sin_addr;
+        c->state = CS_HTTP_HEADERS;
+        c->accepted_mono = now;
+        c->content_length = -1;
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2188,7 +2393,7 @@ int main(int argc, char **argv) {
         pfds[nfds].fd = lfd; pfds[nfds].events = POLLIN; conn_for_pfd[nfds] = NULL; nfds++;
         for (int i = 0; i < MAX_CONNS; i++) {
             if (!g_conns[i].in_use) continue;
-            short events = POLLIN;
+            short events = g_conns[i].rd_eof ? 0 : POLLIN;
             if (g_conns[i].tx_len > g_conns[i].tx_sent) events |= POLLOUT;
             pfds[nfds].fd = g_conns[i].fd;
             pfds[nfds].events = events;
@@ -2200,16 +2405,13 @@ int main(int argc, char **argv) {
         double now = mono_now();
         double next_deadline = now + 5.0;
         for (int i = 0; i < MAX_CONNS; i++) {
-            if (!g_conns[i].in_use) continue;
-            double d = g_conns[i].is_ws
-                ? g_conns[i].last_ping_sent_mono + WS_PING_INTERVAL_S
-                : g_conns[i].last_activity_mono + HTTP_IDLE_TIMEOUT_S;
+            double d = conn_next_deadline(&g_conns[i]);
             if (d < next_deadline) next_deadline = d;
         }
         if (g_use_pending && g_use_flush_deadline < next_deadline) next_deadline = g_use_flush_deadline;
         double timeout_s = next_deadline - now;
         if (timeout_s < 0) timeout_s = 0;
-        int timeout_ms = (int)(timeout_s * 1000.0);
+        int timeout_ms = (int)(timeout_s * 1000.0) + 1;
 
         int pr = poll(pfds, (nfds_t)nfds, timeout_ms);
         if (pr < 0) {
@@ -2218,37 +2420,12 @@ int main(int argc, char **argv) {
             break;
         }
 
-        if (pfds[0].revents & POLLIN) {
-            for (;;) {
-                struct sockaddr_in cliaddr;
-                socklen_t clilen = sizeof cliaddr;
-                int cfd = accept(lfd, (struct sockaddr *)&cliaddr, &clilen);
-                if (cfd < 0) break;
-                int slot = -1;
-                for (int i = 0; i < MAX_CONNS; i++) if (!g_conns[i].in_use) { slot = i; break; }
-                if (slot < 0) { close(cfd); continue; }
-                fcntl(cfd, F_SETFL, O_NONBLOCK);
-                int one = 1;
-                setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-                /* сохраняем ёмкость rx/tx буферов слота (см. conn_reset) — иначе
-                   memset ниже "теряет" ранее выделенную память слота (утечка) */
-                char *saved_rx = g_conns[slot].rx; size_t saved_rx_cap = g_conns[slot].rx_cap;
-                char *saved_tx = g_conns[slot].tx; size_t saved_tx_cap = g_conns[slot].tx_cap;
-                memset(&g_conns[slot], 0, sizeof g_conns[slot]);
-                g_conns[slot].rx = saved_rx; g_conns[slot].rx_cap = saved_rx_cap;
-                g_conns[slot].tx = saved_tx; g_conns[slot].tx_cap = saved_tx_cap;
-                g_conns[slot].fd = cfd;
-                g_conns[slot].in_use = 1;
-                g_conns[slot].state = CS_HTTP_HEADERS;
-                g_conns[slot].last_activity_mono = mono_now();
-                g_conns[slot].content_length = -1;
-            }
-        }
+        if (pfds[0].revents & POLLIN) accept_clients(lfd);
 
         for (int k = 1; k < nfds; k++) {
             Conn *c = conn_for_pfd[k];
-            if (!c || !c->in_use) continue;
-            if (pfds[k].revents & (POLLHUP | POLLERR)) { conn_reset(c); continue; }
+            if (!c || !c->in_use || c->fd != pfds[k].fd) continue;
+            if (pfds[k].revents & (POLLHUP | POLLERR | POLLNVAL)) { conn_reset(c); continue; }
             if (pfds[k].revents & POLLIN) {
                 conn_on_readable(c);
                 if (!c->in_use) continue;
@@ -2260,19 +2437,7 @@ int main(int argc, char **argv) {
         }
 
         now = mono_now();
-        for (int i = 0; i < MAX_CONNS; i++) {
-            Conn *c = &g_conns[i];
-            if (!c->in_use) continue;
-            if (c->is_ws) {
-                if (g_ws_ping_interval > 0 && now - c->last_ping_sent_mono >= g_ws_ping_interval) {
-                    ws_send_frame(c, 0x9, NULL, 0);
-                    c->last_ping_sent_mono = now;
-                    conn_try_flush(c);
-                }
-            } else {
-                if (now - c->last_activity_mono >= HTTP_IDLE_TIMEOUT_S) conn_reset(c);
-            }
-        }
+        for (int i = 0; i < MAX_CONNS; i++) conn_run_timers(&g_conns[i], now);
 
         if (g_use_pending && now >= g_use_flush_deadline) save_data();
     }

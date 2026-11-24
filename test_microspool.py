@@ -671,38 +671,257 @@ def test_websocket():
 # Лимит соединений и утечки
 # ---------------------------------------------------------------------------
 
+def lan_socket(port, src, timeout=3.0, rcvbuf=None):
+    """TCP connection from another loopback address (127.0.0.x, x != 1): the
+    server treats it like a LAN client, which lets the tests exercise the
+    limits that protect Moonraker's 127.0.0.1 connections."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if rcvbuf:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+    s.settimeout(timeout)
+    s.bind((src, 0))
+    s.connect(("127.0.0.1", port))
+    return s
+
+
+def closed_by_server(s, wait=1.5):
+    """True if the server closed the socket within `wait` seconds."""
+    s.settimeout(wait)
+    try:
+        return s.recv(4096) == b""
+    except socket.timeout:
+        return False
+    except (ConnectionResetError, BrokenPipeError):
+        return True
+
+
+def http_on(sock, path="/api/v1/health", host="127.0.0.1"):
+    sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
+    data = b""
+    try:
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (socket.timeout, ConnectionResetError):
+        pass
+    return parse_status(data) if data else None
+
+
 def test_connection_limit():
+    """32 slots; LAN clients get at most 28 and 8 per address; 127.0.0.1 is never starved."""
+    srv = Server()
+    socks = []
+    try:
+        srv.start()
+        port = srv.port
+        t0 = time.time()
+        # 28 idle LAN-like connections from 4 addresses fill the LAN pool
+        for src, n in (("127.0.0.2", 8), ("127.0.0.3", 8), ("127.0.0.4", 8), ("127.0.0.5", 4)):
+            for _ in range(n):
+                socks.append(lan_socket(port, src))
+        time.sleep(0.2)
+        extra_peer = lan_socket(port, "127.0.0.2")
+        check("conn limit: 9th connection from one LAN address is closed", closed_by_server(extra_peer))
+        extra_peer.close()
+        extra_pool = lan_socket(port, "127.0.0.6")
+        check("conn limit: LAN pool full (28) -> new LAN connection closed", closed_by_server(extra_pool, 0.5))
+        extra_pool.close()
+
+        ok = all(http_json(srv.base_url(), "GET", "/api/v1/health")[0] == 200 for _ in range(5))
+        check("conn limit: 127.0.0.1 still served while LAN clients hold 28 slots", ok)
+
+        # take the 4 reserved slots with idle local sockets: all 32 slots in use
+        local_idle = [socket.create_connection(("127.0.0.1", port), timeout=3) for _ in range(4)]
+        socks += local_idle
+        time.sleep(0.2)
+        status, body, _ = http_json(srv.base_url(), "GET", "/api/v1/health")
+        check("conn limit: local client evicts a LAN connection when all 32 slots are taken",
+              status == 200 and body.get("status") == "healthy", f"{status} {body}")
+
+        # after EVICT_MIN_AGE_S a new LAN client may push out the oldest idle LAN socket
+        time.sleep(max(0, 1.3 - (time.time() - t0)))
+        newcomer = lan_socket(port, "127.0.0.7")
+        check("conn limit: new LAN client evicts an idle LAN socket older than 1 s",
+              http_on(newcomer) == 200)
+        newcomer.close()
+        check("conn limit: test finished before the 10 s request deadline", time.time() - t0 < 9)
+    finally:
+        for s in socks:
+            try:
+                s.close()
+            except Exception:
+                pass
+        srv.cleanup()
+
+
+def test_slowloris_deadline():
+    """A client that trickles header bytes is cut off 10 s after connecting."""
     srv = Server()
     try:
         srv.start()
-        socks = []
-        try:
-            for i in range(8):
-                s = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
-                socks.append(s)
-            # 9-е соединение сервер обязан принять и сразу закрыть
-            s9 = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
-            s9.settimeout(2.0)
-            data = b""
+        s = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
+        t0 = time.time()
+        s.sendall(b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+        closed_at = None
+        got = b""
+        while time.time() - t0 < 14:
             try:
-                data = s9.recv(4096)
+                s.sendall(b"X-Slow: 1\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                closed_at = time.time() - t0
+                break
+            s.settimeout(0.5)
+            try:
+                chunk = s.recv(4096)
+                if chunk == b"":
+                    closed_at = time.time() - t0
+                    break
+                got += chunk
             except socket.timeout:
                 pass
-            check("conn limit: 9-е соединение закрыто сервером (EOF)", data == b"", f"got {data!r}")
-            s9.close()
+            except ConnectionResetError:
+                closed_at = time.time() - t0
+                break
+        s.close()
+        check("slowloris: trickling client closed at the 10 s deadline",
+              closed_at is not None and 9.0 <= closed_at <= 12.0, f"closed_at={closed_at}")
+        check("slowloris: no response was sent to the incomplete request", got == b"", got[:80])
+        status, _, _ = http_json(srv.base_url(), "GET", "/api/v1/health")
+        check("slowloris: server still serves others", status == 200)
 
-            # сервер по-прежнему жив: закрываем один слот и делаем обычный запрос
-            socks[0].close()
-            socks = socks[1:]
-            time.sleep(0.1)
-            status, body, _ = http_json(srv.base_url(), "GET", "/api/v1/health")
-            check("conn limit: сервер жив после лимита", status == 200 and body.get("status") == "healthy")
-        finally:
-            for s in socks:
-                try:
-                    s.close()
-                except Exception:
-                    pass
+        # a complete request followed by a stream of junk: answered, junk not buffered
+        s = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
+        s.sendall(b"GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n" + b"x" * 200000)
+        data = b""
+        try:
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        except (socket.timeout, ConnectionResetError):
+            pass
+        s.close()
+        check("closing state: request + trailing junk still answered 200", parse_status(data) == 200 if data else False)
+    finally:
+        srv.cleanup()
+
+
+def ws_handshake(sock, path="/api/v1/spool", headers=None, host="127.0.0.1"):
+    key = "dGhlIHNhbXBsZSBub25jZQ=="
+    lines = [f"GET {path} HTTP/1.1", f"Host: {host}", "Upgrade: websocket", "Connection: Upgrade",
+             f"Sec-WebSocket-Key: {key}", "Sec-WebSocket-Version: 13"]
+    for k, v in (headers or {}).items():
+        lines.append(f"{k}: {v}")
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    head, _, rest = data.partition(b"\r\n\r\n")
+    return parse_status(head) if head else None, rest
+
+
+def ws_frame(opcode, payload=b"", mask=b"\x01\x02\x03\x04"):
+    hdr = bytes([0x80 | opcode])
+    n = len(payload)
+    if n < 126:
+        hdr += bytes([0x80 | n])
+    elif n <= 0xFFFF:
+        hdr += bytes([0x80 | 126]) + n.to_bytes(2, "big")
+    else:
+        hdr += bytes([0x80 | 127]) + n.to_bytes(8, "big")
+    return hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def test_ws_ping_interval_and_timeout():
+    srv = Server()
+    try:
+        srv.start(extra_args=["-k", "1"])
+        s = socket.create_connection(("127.0.0.1", srv.port), timeout=5)
+        status, rest = ws_handshake(s)
+        check("ws -k 1: handshake 101", status == 101)
+        t0 = time.time()
+        data = rest
+        s.settimeout(2.0)
+        try:
+            while len(data) < 2:
+                data += s.recv(64)
+        except socket.timeout:
+            pass
+        check("ws -k 1: server ping arrives after ~1 s (uses -k, not the 20 s default)",
+              len(data) >= 2 and data[0] == 0x89 and time.time() - t0 < 1.8, f"{data[:4]!r} t={time.time()-t0:.2f}")
+        # never answer: the server must drop us after 3 intervals of silence
+        closed_at = None
+        s.settimeout(0.5)
+        while time.time() - t0 < 8:
+            try:
+                chunk = s.recv(64)
+                if chunk == b"":
+                    closed_at = time.time() - t0
+                    break
+            except socket.timeout:
+                pass
+            except ConnectionResetError:
+                closed_at = time.time() - t0
+                break
+        s.close()
+        check("ws -k 1: silent peer closed after ~3 s", closed_at is not None and 2.5 <= closed_at <= 5.0,
+              f"closed_at={closed_at}")
+
+        async def tornado_client(ping_interval):
+            from tornado.websocket import websocket_connect
+            conn = await websocket_connect(f"ws://127.0.0.1:{srv.port}/api/v1/spool",
+                                           connect_timeout=5.0, ping_interval=ping_interval)
+            fut = asyncio.ensure_future(conn.read_message())
+            await asyncio.sleep(5.0)
+            alive = not fut.done()
+            conn.close()
+            fut.cancel()
+            return alive
+
+        # Moonraker with tornado < 6.5 sends no pings itself; tornado answers ours.
+        check("ws -k 1: tornado client without own pings stays connected 5 s",
+              asyncio.run(tornado_client(None)))
+        check("ws -k 1: tornado client with 20 s pings (Moonraker, tornado >= 6.5) stays connected 5 s",
+              asyncio.run(tornado_client(20.0)))
+    finally:
+        srv.cleanup()
+
+
+def test_ws_slow_reader_capped():
+    """A websocket client that never reads cannot grow server memory via pong echoes."""
+    srv = Server()
+    try:
+        srv.start(extra_args=["-k", "0"])
+        rss0 = get_rss_kb(srv.proc.pid)
+        s = lan_socket(srv.port, "127.0.0.2", timeout=5, rcvbuf=4096)
+        status, _ = ws_handshake(s)
+        check("ws slow reader: handshake 101", status == 101)
+        ping = ws_frame(0x9, b"p" * 125)
+        burst = ping * 512
+        sent = 0
+        dropped = False
+        s.settimeout(2.0)
+        t0 = time.time()
+        while sent < 40 * 1024 * 1024 and time.time() - t0 < 20:
+            try:
+                s.sendall(burst)
+                sent += len(burst)
+            except (BrokenPipeError, ConnectionResetError, socket.timeout):
+                dropped = True
+                break
+        rss1 = get_rss_kb(srv.proc.pid)
+        s.close()
+        check("ws slow reader: server dropped the non-reading client", dropped, f"sent={sent}")
+        check(f"ws slow reader: RSS stayed bounded (before={rss0}KB after={rss1}KB)",
+              rss1 - rss0 < 2048, f"delta={rss1 - rss0}KB")
+        status, _, _ = http_json(srv.base_url(), "GET", "/api/v1/health")
+        check("ws slow reader: server still alive", status == 200)
     finally:
         srv.cleanup()
 
@@ -766,6 +985,9 @@ def main():
     test_corrupt_file()
     test_websocket()
     test_connection_limit()
+    test_slowloris_deadline()
+    test_ws_ping_interval_and_timeout()
+    test_ws_slow_reader_capped()
     test_no_leak_2000_requests()
 
     print(f"\n{PASSES} passed, {len(FAILURES)} failed")
