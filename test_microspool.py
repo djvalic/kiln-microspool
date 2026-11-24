@@ -657,6 +657,108 @@ def test_deferred_use_flush():
         srv.cleanup()
 
 
+def test_input_validation():
+    srv = Server()
+    try:
+        srv.start()
+        port, base = srv.port, srv.base_url()
+
+        def post(path, raw_body, method="POST"):
+            raw = raw_http(port, method, path, {"Content-Type": "application/json",
+                                                "Content-Length": str(len(raw_body))}, body=raw_body)
+            return parse_status(raw)
+
+        check("utf-8: invalid byte 0xff -> 400", post("/api/v1/vendor", b'{"name":"a\xffb"}') == 400)
+        check("utf-8: overlong '/' (c0 af) -> 400", post("/api/v1/vendor", b'{"name":"\xc0\xaf"}') == 400)
+        check("utf-8: UTF-8 encoded surrogate -> 400", post("/api/v1/vendor", b'{"name":"\xed\xa0\x80"}') == 400)
+        check("utf-8: truncated sequence -> 400", post("/api/v1/vendor", b'{"name":"\xe2\x82"}') == 400)
+        check("utf-8: above U+10FFFF -> 400", post("/api/v1/vendor", b'{"name":"\xf4\x90\x80\x80"}') == 400)
+        name = "Ä € 😀 ПЛА"
+        status, v, _ = http_json(base, "POST", "/api/v1/vendor", {"name": name})
+        check("utf-8: valid multi-byte text accepted and returned as is", status == 200 and v["name"] == name, v)
+
+        check("numbers: density 1e999 (inf) -> 400",
+              post("/api/v1/filament", b'{"density":1e999,"diameter":1.75}') == 400)
+        check("numbers: diameter -1e999 -> 400",
+              post("/api/v1/filament", b'{"density":1.24,"diameter":-1e999}') == 400)
+        check("numbers: price 1e10 (absurd) -> 400",
+              post("/api/v1/filament", b'{"density":1.24,"diameter":1.75,"price":1e10}') == 400)
+        check("numbers: vendor_id 1e20 (llround overflow) -> 400",
+              post("/api/v1/filament", b'{"density":1.24,"diameter":1.75,"vendor_id":1e20}') == 400)
+        check("numbers: settings_extruder_temp 3e9 -> 400",
+              post("/api/v1/filament", b'{"density":1.24,"diameter":1.75,"settings_extruder_temp":3e9}') == 400)
+        status, f, _ = http_json(base, "POST", "/api/v1/filament", {"density": 1.24, "diameter": 1.75, "weight": 1000})
+        status, sp, _ = http_json(base, "POST", "/api/v1/spool", {"filament_id": f["id"]})
+        check("numbers: use_weight 1e999 -> 400",
+              post(f"/api/v1/spool/{sp['id']}/use", b'{"use_weight":1e999}', "PUT") == 400)
+        status, sp2, _ = http_json(base, "GET", f"/api/v1/spool/{sp['id']}")
+        check("numbers: rejected use left used_weight unchanged", sp2["used_weight"] == 0, sp2)
+
+        status, _, _ = http_json(base, "PATCH", f"/api/v1/spool/{sp['id']}", {"extra": {"a": 1}})
+        check("extra: number value -> 400 (Spoolman stores strings only)", status == 400)
+        status, _, _ = http_json(base, "PATCH", f"/api/v1/spool/{sp['id']}", {"extra": {"a": {"b": "c"}}})
+        check("extra: object value -> 400", status == 400)
+        status, sp3, _ = http_json(base, "PATCH", f"/api/v1/spool/{sp['id']}", {"extra": {"a": "1", "b": "\"x\""}})
+        check("extra: string values accepted", status == 200 and sp3["extra"] == {"a": "1", "b": "\"x\""}, sp3)
+    finally:
+        srv.cleanup()
+
+
+def start_with_datafile(content, extra_files=None):
+    """Writes `content` as the data file (plus optional other files) and starts
+    the binary; returns (proc or None if it exited, rc, stderr, tmpdir, datafile)."""
+    tmpdir = tempfile.mkdtemp(prefix="microspool_test_df_")
+    datafile = os.path.join(tmpdir, "microspool.json")
+    if content is not None:
+        with open(datafile, "w", encoding="utf-8") as fh:
+            fh.write(content if isinstance(content, str) else json.dumps(content))
+    for name, data in (extra_files or {}).items():
+        with open(os.path.join(tmpdir, name), "w", encoding="utf-8") as fh:
+            fh.write(data if isinstance(data, str) else json.dumps(data))
+    srv = Server(datafile=datafile, tmpdir=tmpdir)
+    srv.start(wait_ready=False)
+    try:
+        srv.wait_ready(timeout=3)
+        return srv, None, ""
+    except RuntimeError as e:
+        rc = srv.proc.returncode
+        return srv, rc, str(e)
+
+
+def db(vendors=(), filaments=(), spools=(), next_id=None):
+    return {"version": 1, "next_id": next_id or {"vendor": 1, "filament": 1, "spool": 1},
+            "vendors": list(vendors), "filaments": list(filaments), "spools": list(spools)}
+
+
+def test_datafile_id_validation():
+    v = lambda i: {"id": i, "registered": "2026-01-01T00:00:00+00:00", "name": f"V{i}", "extra": {}}
+    cases = [
+        ("duplicate vendor id", db(vendors=[v(1), v(1)])),
+        ("id INT_MAX (next id would overflow)", db(vendors=[v(2147483647)])),
+        ("fractional id", db(vendors=[v(1.5)])),
+        ("id 0", db(vendors=[v(0)])),
+    ]
+    for label, content in cases:
+        srv, rc, err = start_with_datafile(content)
+        try:
+            check(f"data file: {label} -> refuses to start (rc 1)", rc == 1, f"rc={rc} {err[-200:]}")
+        finally:
+            srv.cleanup()
+
+    srv, rc, err = start_with_datafile(db(vendors=[dict(v(3), extra={"n": 5, "s": "x"})],
+                                          next_id={"vendor": 2147483647 * 4, "filament": -5, "spool": "x"}))
+    try:
+        check("data file: absurd next_id values tolerated", rc is None, err)
+        if rc is None:
+            status, got, _ = http_json(srv.base_url(), "GET", "/api/v1/vendor/3")
+            check("data file: old non-string extra value migrated to its JSON text",
+                  status == 200 and got["extra"] == {"n": "5", "s": "x"}, got)
+            status, nv, _ = http_json(srv.base_url(), "POST", "/api/v1/vendor", {"name": "next"})
+            check("data file: next id continues after the highest id", status == 200 and nv["id"] == 4, nv)
+    finally:
+        srv.cleanup()
+
+
 def test_corrupt_file():
     tmpdir = tempfile.mkdtemp(prefix="microspool_test_corrupt_")
     datafile = os.path.join(tmpdir, "microspool.json")
@@ -1092,6 +1194,8 @@ def main():
     test_persistence()
     test_deferred_use_flush()
     test_corrupt_file()
+    test_input_validation()
+    test_datafile_id_validation()
     test_websocket()
     test_connection_limit()
     test_slowloris_deadline()

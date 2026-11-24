@@ -48,6 +48,7 @@
 #define EXTRA_CAP       1024   /* буфер под сериализованный JSON "extra" */
 
 #define BODY_LIMIT      16384  /* тело запроса <= 16 КБ, иначе 413 */
+#define NUM_ABS_MAX     1e9    /* numbers in requests: finite and |x| <= 1e9 (1000 t of filament) */
 #define HEADER_LIMIT    8192   /* защита от неограниченного роста буфера заголовков */
 
 /* Connections. Moonraker keeps one websocket open all the time and makes short
@@ -388,6 +389,9 @@ static int jget_number(const cJSON *obj, const char *key, double *out,
     if (!item) return 0;
     if (cJSON_IsNull(item)) return 0;
     if (!cJSON_IsNumber(item)) return -1;
+    /* cJSON turns 1e999 into inf, which would pass every "> 0" check; also keeps
+       llround() in jget_int well inside int range. */
+    if (!isfinite(item->valuedouble) || fabs(item->valuedouble) > NUM_ABS_MAX) return -1;
     *out = item->valuedouble;
     *has = 1;
     return 0;
@@ -416,7 +420,9 @@ static int jget_bool(const cJSON *obj, const char *key, int *out,
 }
 
 /* extra: объект произвольных строковых значений; храним как сериализованный
-   компактный JSON-текст. present/has по тем же правилам, что и выше. */
+   компактный JSON-текст. present/has по тем же правилам, что и выше. Like
+   Spoolman, every value must be a string (clients store JSON-encoded values
+   in it, e.g. "\"PLA+\"" or "0.0400"). */
 static int jget_extra(const cJSON *obj, char *buf, size_t bufsz,
                        int *present, int *has) {
     cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, "extra");
@@ -425,6 +431,8 @@ static int jget_extra(const cJSON *obj, char *buf, size_t bufsz,
     if (!item) return 0;
     if (cJSON_IsNull(item)) return 0;
     if (!cJSON_IsObject(item)) return -1;
+    const cJSON *ch;
+    cJSON_ArrayForEach(ch, item) if (!cJSON_IsString(ch) || ch->string == NULL) return -1;
     char *s = cJSON_PrintUnformatted(item);
     if (!s) return -1;
     size_t len = strlen(s);
@@ -433,6 +441,33 @@ static int jget_extra(const cJSON *obj, char *buf, size_t bufsz,
     free(s);
     *has = 1;
     return 0;
+}
+
+/* Strict UTF-8 check (no overlong forms, no surrogates, <= U+10FFFF). cJSON
+   copies string bytes as they are, so invalid UTF-8 would be stored and later
+   sent to clients that fail to decode it. */
+static int utf8_valid(const unsigned char *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned char c = s[i];
+        if (c < 0x80) { i++; continue; }
+        size_t len;
+        uint32_t cp;
+        if (c >= 0xC2 && c <= 0xDF)      { len = 2; cp = c & 0x1Fu; }
+        else if (c >= 0xE0 && c <= 0xEF) { len = 3; cp = c & 0x0Fu; }
+        else if (c >= 0xF0 && c <= 0xF4) { len = 4; cp = c & 0x07u; }
+        else return 0;
+        if (n - i < len) return 0;
+        for (size_t k = 1; k < len; k++) {
+            if ((s[i + k] & 0xC0) != 0x80) return 0;
+            cp = (cp << 6) | (s[i + k] & 0x3Fu);
+        }
+        if (len == 3 && cp < 0x800) return 0;
+        if (len == 4 && (cp < 0x10000 || cp > 0x10FFFF)) return 0;
+        if (cp >= 0xD800 && cp <= 0xDFFF) return 0;
+        i += len;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -506,20 +541,42 @@ static void safe_copy_str(char *dst, size_t dstsz, const cJSON *item) {
     }
 }
 
-/* extra from the data file: a JSON object -> compact text, anything else -> "{}". */
+/* extra from the data file: a JSON object -> compact text, anything else -> "{}".
+   Older versions accepted non-string values; they are turned into their JSON
+   text as a string, which is what Spoolman stores. */
 static void load_extra_raw(const cJSON *o, char *buf, size_t bufsz) {
     const cJSON *extra = cJSON_GetObjectItemCaseSensitive(o, "extra");
-    char *s = cJSON_IsObject(extra) ? cJSON_PrintUnformatted(extra) : NULL;
+    cJSON *copy = cJSON_IsObject(extra) ? cJSON_Duplicate(extra, 1) : NULL;
+    for (cJSON *ch = copy ? copy->child : NULL; ch; ) {
+        cJSON *next = ch->next;
+        if (!cJSON_IsString(ch) && ch->string) {
+            char *t = cJSON_PrintUnformatted(ch);
+            cJSON *str = cJSON_CreateString(t ? t : "null");
+            free(t);
+            if (str && !cJSON_ReplaceItemInObjectCaseSensitive(copy, ch->string, str)) cJSON_Delete(str);
+        }
+        ch = next;
+    }
+    char *s = copy ? cJSON_PrintUnformatted(copy) : NULL;
+    cJSON_Delete(copy);
     if (s && strlen(s) < bufsz) memcpy(buf, s, strlen(s) + 1);
     else snprintf(buf, bufsz, "{}");
     free(s);
 }
 
+/* id from the data file: an integer in 1..INT_MAX-1 (so next_id = max+1 cannot overflow). */
+static int load_id_raw(const cJSON *o, int *out) {
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "id");
+    if (!cJSON_IsNumber(id)) return -1;
+    double d = id->valuedouble;
+    if (!(d >= 1 && d < (double)INT_MAX) || d != floor(d)) return -1;
+    *out = (int)d;
+    return 0;
+}
+
 static int load_vendor_raw(const cJSON *o, Vendor *v) {
     memset(v, 0, sizeof *v);
-    cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "id");
-    if (!cJSON_IsNumber(id)) return -1;
-    v->id = id->valueint;
+    if (load_id_raw(o, &v->id) != 0) return -1;
     safe_copy_str(v->registered, sizeof v->registered, cJSON_GetObjectItemCaseSensitive(o, "registered"));
     safe_copy_str(v->name, sizeof v->name, cJSON_GetObjectItemCaseSensitive(o, "name"));
     cJSON *c = cJSON_GetObjectItemCaseSensitive(o, "comment");
@@ -534,9 +591,7 @@ static int load_vendor_raw(const cJSON *o, Vendor *v) {
 
 static int load_filament_raw(const cJSON *o, Filament *f) {
     memset(f, 0, sizeof *f);
-    cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "id");
-    if (!cJSON_IsNumber(id)) return -1;
-    f->id = id->valueint;
+    if (load_id_raw(o, &f->id) != 0) return -1;
     safe_copy_str(f->registered, sizeof f->registered, cJSON_GetObjectItemCaseSensitive(o, "registered"));
     cJSON *name = cJSON_GetObjectItemCaseSensitive(o, "name");
     if (name) { f->has_name = 1; safe_copy_str(f->name, sizeof f->name, name); }
@@ -576,9 +631,7 @@ static int load_filament_raw(const cJSON *o, Filament *f) {
 
 static int load_spool_raw(const cJSON *o, Spool *s) {
     memset(s, 0, sizeof *s);
-    cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "id");
-    if (!cJSON_IsNumber(id)) return -1;
-    s->id = id->valueint;
+    if (load_id_raw(o, &s->id) != 0) return -1;
     safe_copy_str(s->registered, sizeof s->registered, cJSON_GetObjectItemCaseSensitive(o, "registered"));
     cJSON *fu = cJSON_GetObjectItemCaseSensitive(o, "first_used");
     if (fu) { s->has_first_used = 1; safe_copy_str(s->first_used, sizeof s->first_used, fu); }
@@ -658,6 +711,15 @@ static void save_data(void) {
     g_data_dirty_immediate = 0;
     g_use_pending = 0;
     g_last_use_flush_mono = mono_now();
+}
+
+/* next_id from the data file; out-of-range values fall back to 1 (the max-id
+   scan below then moves it past the existing records). */
+static int next_id_raw(const cJSON *n) {
+    if (!cJSON_IsNumber(n)) return 1;
+    double d = n->valuedouble;
+    if (!(d >= 1 && d <= (double)INT_MAX) || d != floor(d)) return 1;
+    return (int)d;
 }
 
 /* читает файл целиком; возвращает malloc'нутый буфер (с NUL) или NULL */
@@ -740,9 +802,17 @@ static int load_data(void) {
     cJSON *nv = cJSON_GetObjectItemCaseSensitive(nid, "vendor");
     cJSON *nf = cJSON_GetObjectItemCaseSensitive(nid, "filament");
     cJSON *ns = cJSON_GetObjectItemCaseSensitive(nid, "spool");
-    g_next_vendor_id = cJSON_IsNumber(nv) ? nv->valueint : 1;
-    g_next_filament_id = cJSON_IsNumber(nf) ? nf->valueint : 1;
-    g_next_spool_id = cJSON_IsNumber(ns) ? ns->valueint : 1;
+    /* duplicate ids would make find/patch/delete hit only the first record */
+    for (int a = 0; a < MAX_VENDORS; a++) for (int b = a + 1; b < MAX_VENDORS && g_vendors[a].id; b++)
+        if (g_vendors[a].id == g_vendors[b].id) { fprintf(stderr, "microspool: duplicate vendor id %d in the data file\n", g_vendors[a].id); cJSON_Delete(root); return -1; }
+    for (int a = 0; a < MAX_FILAMENTS; a++) for (int b = a + 1; b < MAX_FILAMENTS && g_filaments[a].id; b++)
+        if (g_filaments[a].id == g_filaments[b].id) { fprintf(stderr, "microspool: duplicate filament id %d in the data file\n", g_filaments[a].id); cJSON_Delete(root); return -1; }
+    for (int a = 0; a < MAX_SPOOLS; a++) for (int b = a + 1; b < MAX_SPOOLS && g_spools[a].id; b++)
+        if (g_spools[a].id == g_spools[b].id) { fprintf(stderr, "microspool: duplicate spool id %d in the data file\n", g_spools[a].id); cJSON_Delete(root); return -1; }
+
+    g_next_vendor_id = next_id_raw(nv);
+    g_next_filament_id = next_id_raw(nf);
+    g_next_spool_id = next_id_raw(ns);
     /* защита от рассинхронизации: next_id не должен быть <= максимального id */
     for (int k = 0; k < MAX_VENDORS; k++) if (g_vendors[k].id >= g_next_vendor_id) g_next_vendor_id = g_vendors[k].id + 1;
     for (int k = 0; k < MAX_FILAMENTS; k++) if (g_filaments[k].id >= g_next_filament_id) g_next_filament_id = g_filaments[k].id + 1;
@@ -797,7 +867,8 @@ static double weight_to_length_mm(double weight_g, double density, double diamet
     double r = diameter_mm / 2.0;
     double denom = density * M_PI * r * r / 1000.0;
     if (denom <= 0) return 0;
-    return weight_g / denom;
+    double len = weight_g / denom;
+    return isfinite(len) ? len : 0;   /* cJSON would print inf as null */
 }
 
 static cJSON *spool_response_json(const Spool *s) {
@@ -882,7 +953,7 @@ static int vendor_apply_fields(const cJSON *input, Vendor *v, int is_create, cha
 
     char ebuf[EXTRA_CAP];
     rc = jget_extra(input, ebuf, sizeof ebuf, &present, &has);
-    if (rc != 0) { snprintf(msg, msgsz, "extra must be a JSON object (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
+    if (rc != 0) { snprintf(msg, msgsz, "extra must be an object with string values (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
     if (present) strcpy(v->extra, has ? ebuf : "{}");
     else if (is_create) strcpy(v->extra, "{}");
     return 0;
@@ -895,6 +966,7 @@ static int vendor_create(const cJSON *input, cJSON **body_out, char *msg, size_t
     if (!slot) { snprintf(msg, msgsz, "vendor limit reached (%d)", MAX_VENDORS); return 400; }
     Vendor tmp; memset(&tmp, 0, sizeof tmp);
     if (vendor_apply_fields(input, &tmp, 1, msg, msgsz) != 0) return 400;
+    if (g_next_vendor_id >= INT_MAX) { snprintf(msg, msgsz, "vendor ids exhausted"); return 400; }
     tmp.id = g_next_vendor_id++;
     now_iso(tmp.registered, sizeof tmp.registered);
     *slot = tmp;
@@ -1052,7 +1124,7 @@ static int filament_apply_fields(const cJSON *input, Filament *f, int is_create,
 
     char ebuf[EXTRA_CAP];
     rc = jget_extra(input, ebuf, sizeof ebuf, &present, &has);
-    if (rc != 0) { snprintf(msg, msgsz, "extra must be a JSON object (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
+    if (rc != 0) { snprintf(msg, msgsz, "extra must be an object with string values (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
     if (present) strcpy(f->extra, has ? ebuf : "{}");
     else if (is_create) strcpy(f->extra, "{}");
     return 0;
@@ -1065,6 +1137,7 @@ static int filament_create(const cJSON *input, cJSON **body_out, char *msg, size
     if (!slot) { snprintf(msg, msgsz, "filament limit reached (%d)", MAX_FILAMENTS); return 400; }
     Filament tmp; memset(&tmp, 0, sizeof tmp);
     if (filament_apply_fields(input, &tmp, 1, msg, msgsz) != 0) return 400;
+    if (g_next_filament_id >= INT_MAX) { snprintf(msg, msgsz, "filament ids exhausted"); return 400; }
     tmp.id = g_next_filament_id++;
     now_iso(tmp.registered, sizeof tmp.registered);
     *slot = tmp;
@@ -1210,7 +1283,7 @@ static int spool_apply_fields(const cJSON *input, Spool *s, int is_create, char 
 
     char ebuf[EXTRA_CAP];
     rc = jget_extra(input, ebuf, sizeof ebuf, &present, &has);
-    if (rc != 0) { snprintf(msg, msgsz, "extra must be a JSON object (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
+    if (rc != 0) { snprintf(msg, msgsz, "extra must be an object with string values (serialized <=%d bytes)", EXTRA_CAP - 1); return -1; }
     if (present) strcpy(s->extra, has ? ebuf : "{}");
     else if (is_create) strcpy(s->extra, "{}");
 
@@ -1226,6 +1299,7 @@ static int spool_create(const cJSON *input, cJSON **body_out, char *msg, size_t 
     Spool tmp; memset(&tmp, 0, sizeof tmp);
     strcpy(tmp.extra, "{}");
     if (spool_apply_fields(input, &tmp, 1, msg, msgsz) != 0) return 400;
+    if (g_next_spool_id >= INT_MAX) { snprintf(msg, msgsz, "spool ids exhausted"); return 400; }
     tmp.id = g_next_spool_id++;
     now_iso(tmp.registered, sizeof tmp.registered);
     *slot = tmp;
@@ -1299,6 +1373,7 @@ static int spool_use(int id, const cJSON *input, cJSON **body_out, char *msg, si
         double denom = density * M_PI * r * r / 1000.0; /* г на мм длины */
         delta = use_length * denom;
     }
+    if (!isfinite(s->used_weight + delta)) { snprintf(msg, msgsz, "use out of range"); return 400; }
     s->used_weight += delta;
     char ts[32];
     now_iso(ts, sizeof ts);
@@ -1958,6 +2033,10 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         if (body_len == 0) {
             input = cJSON_CreateObject();
         } else {
+            if (!utf8_valid((const unsigned char *)body, body_len)) {
+                http_send_error(c, 400, "request body is not valid UTF-8");
+                return;
+            }
             input = cJSON_ParseWithLength(body, body_len);
             if (!input || !cJSON_IsObject(input)) {
                 if (input) cJSON_Delete(input);
