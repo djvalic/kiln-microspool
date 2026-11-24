@@ -40,7 +40,25 @@ import time
 import urllib.request
 import urllib.error
 
-BINARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "microspool")
+HERE = os.path.dirname(os.path.abspath(__file__))
+# MICROSPOOL_BINARY: test another build (e.g. a wrapper that runs the MIPS
+# build under qemu); by default the native build next to this file, made
+# with `make native` when it is missing (Kiln OS's plugin checks)
+BINARY = os.environ.get("MICROSPOOL_BINARY") or os.path.join(HERE, "microspool")
+try:
+    import tornado  # noqa: F401  (the websocket tests use Moonraker's client)
+    HAVE_TORNADO = True
+except ImportError:
+    HAVE_TORNADO = False
+SKIPPED = []
+
+
+def needs_tornado(fn):
+    if HAVE_TORNADO:
+        fn()
+    else:
+        SKIPPED.append(fn.__name__)
+        print(f"[SKIP] {fn.__name__}: tornado is not installed")
 
 FAILURES = []
 PASSES = 0
@@ -1540,6 +1558,8 @@ def test_no_leak_2000_requests():
 # ---------------------------------------------------------------------------
 
 def main():
+    if not os.path.exists(BINARY) and "MICROSPOOL_BINARY" not in os.environ:
+        subprocess.run(["make", "-C", HERE, "native"], check=False)
     if not os.path.exists(BINARY):
         print(f"не найден бинарник {BINARY}; сначала выполните `make native`", file=sys.stderr)
         return 1
@@ -1556,7 +1576,7 @@ def main():
         srv.cleanup()
 
     test_api_gaps()
-    test_ws_subscriptions()
+    needs_tornado(test_ws_subscriptions)
     test_ui()
     test_ui_disabled()
     test_ui_security_headers()
@@ -1574,14 +1594,14 @@ def main():
     test_lan_write_rate_limit()
     test_input_validation()
     test_datafile_id_validation()
-    test_websocket()
+    needs_tornado(test_websocket)
     test_connection_limit()
     test_slowloris_deadline()
-    test_ws_ping_interval_and_timeout()
+    needs_tornado(test_ws_ping_interval_and_timeout)
     test_ws_slow_reader_capped()
     test_no_leak_2000_requests()
 
-    print(f"\n{PASSES} passed, {len(FAILURES)} failed")
+    print(f"\n{PASSES} passed, {len(FAILURES)} failed" + (f", skipped (no tornado): {', '.join(SKIPPED)}" if SKIPPED else ""))
     if FAILURES:
         print("Провалившиеся тесты:")
         for name in FAILURES:
