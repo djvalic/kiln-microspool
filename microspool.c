@@ -93,10 +93,11 @@ static void log_v(const char *fmt, ...) {
 static void now_iso(char *buf, size_t bufsz) {
     time_t t = time(NULL);
     struct tm tmv;
-    gmtime_r(&t, &tmv);
-    snprintf(buf, bufsz, "%04d-%02d-%02dT%02d:%02d:%02d+00:00",
-              tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-              tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    /* strftime instead of snprintf("%04d..."): no -Wformat-truncation, and a
+       year past 9999 just yields an empty string instead of a cut-off one. */
+    if (gmtime_r(&t, &tmv) == NULL || strftime(buf, bufsz, "%Y-%m-%dT%H:%M:%S+00:00", &tmv) == 0) {
+        if (bufsz) buf[0] = 0;
+    }
 }
 
 static double mono_now(void) {
@@ -484,6 +485,15 @@ static void safe_copy_str(char *dst, size_t dstsz, const cJSON *item) {
     }
 }
 
+/* extra from the data file: a JSON object -> compact text, anything else -> "{}". */
+static void load_extra_raw(const cJSON *o, char *buf, size_t bufsz) {
+    const cJSON *extra = cJSON_GetObjectItemCaseSensitive(o, "extra");
+    char *s = cJSON_IsObject(extra) ? cJSON_PrintUnformatted(extra) : NULL;
+    if (s && strlen(s) < bufsz) memcpy(buf, s, strlen(s) + 1);
+    else snprintf(buf, bufsz, "{}");
+    free(s);
+}
+
 static int load_vendor_raw(const cJSON *o, Vendor *v) {
     memset(v, 0, sizeof *v);
     cJSON *id = cJSON_GetObjectItemCaseSensitive(o, "id");
@@ -497,10 +507,7 @@ static int load_vendor_raw(const cJSON *o, Vendor *v) {
     if (cJSON_IsNumber(esw)) { v->has_empty_spool_weight = 1; v->empty_spool_weight = esw->valuedouble; }
     cJSON *ext = cJSON_GetObjectItemCaseSensitive(o, "external_id");
     if (ext) { v->has_external_id = 1; safe_copy_str(v->external_id, sizeof v->external_id, ext); }
-    cJSON *extra = cJSON_GetObjectItemCaseSensitive(o, "extra");
-    char *s = cJSON_PrintUnformatted(extra ? extra : cJSON_CreateObject());
-    if (s) { strncpy(v->extra, s, sizeof v->extra - 1); free(s); }
-    else strcpy(v->extra, "{}");
+    load_extra_raw(o, v->extra, sizeof v->extra);
     return 0;
 }
 
@@ -542,10 +549,7 @@ static int load_filament_raw(const cJSON *o, Filament *f) {
     if (mcd) { f->has_multi_color_direction = 1; safe_copy_str(f->multi_color_direction, sizeof f->multi_color_direction, mcd); }
     cJSON *extid = cJSON_GetObjectItemCaseSensitive(o, "external_id");
     if (extid) { f->has_external_id = 1; safe_copy_str(f->external_id, sizeof f->external_id, extid); }
-    cJSON *extra = cJSON_GetObjectItemCaseSensitive(o, "extra");
-    char *s = cJSON_PrintUnformatted(extra ? extra : cJSON_CreateObject());
-    if (s) { strncpy(f->extra, s, sizeof f->extra - 1); free(s); }
-    else strcpy(f->extra, "{}");
+    load_extra_raw(o, f->extra, sizeof f->extra);
     return 0;
 }
 
@@ -577,10 +581,7 @@ static int load_spool_raw(const cJSON *o, Spool *s) {
     if (cm) { s->has_comment = 1; safe_copy_str(s->comment, sizeof s->comment, cm); }
     cJSON *arc = cJSON_GetObjectItemCaseSensitive(o, "archived");
     s->archived = cJSON_IsTrue(arc) ? 1 : 0;
-    cJSON *extra = cJSON_GetObjectItemCaseSensitive(o, "extra");
-    char *s2 = cJSON_PrintUnformatted(extra ? extra : cJSON_CreateObject());
-    if (s2) { strncpy(s->extra, s2, sizeof s->extra - 1); free(s2); }
-    else strcpy(s->extra, "{}");
+    load_extra_raw(o, s->extra, sizeof s->extra);
     return 0;
 }
 
@@ -1583,7 +1584,8 @@ static void ws_send_frame(Conn *c, int opcode, const unsigned char *payload, siz
         hdr[hn++] = (unsigned char)(len);
     } else {
         hdr[hn++] = 127;
-        for (int i = 7; i >= 0; i--) hdr[hn++] = (unsigned char)(len >> (8 * i));
+        /* uint64_t: with a 32-bit size_t (MIPS32, ARMv7) shifting by 32..56 bits is undefined */
+        for (int i = 7; i >= 0; i--) hdr[hn++] = (unsigned char)((uint64_t)len >> (8 * i));
     }
     conn_tx_append(c, hdr, hn);
     if (len) conn_tx_append(c, payload, len);
@@ -1777,7 +1779,7 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         http_send_json(c, 200, o, -1);
         return;
     }
-    if (strncmp(path, "/api/v1/setting/", 17) == 0) {
+    if (strncmp(path, "/api/v1/setting/", 16) == 0) {
         http_send_error(c, 404, "not found");
         return;
     }
