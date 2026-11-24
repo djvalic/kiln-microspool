@@ -1017,18 +1017,20 @@ static int load_data(void) {
     return -1;
 }
 
-/* Removes <datafile>.tmp-* and <datafile>.bak.tmp-* left by a crash. */
+/* Removes <datafile>.tmp-*, .bak.tmp-* and .corrupt.tmp-* left by a crash. */
 static void remove_stale_temp_files(void) {
     const char *slash = strrchr(g_data_path, '/');
     const char *base = slash ? slash + 1 : g_data_path;
-    char p1[300], p2[300];
+    char p1[300], p2[300], p3[300];
     snprintf(p1, sizeof p1, "%s.tmp-", base);
     snprintf(p2, sizeof p2, "%s.bak.tmp-", base);
+    snprintf(p3, sizeof p3, "%s.corrupt.tmp-", base);
     DIR *d = opendir(g_data_dir);
     if (!d) return;
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
-        if (strncmp(de->d_name, p1, strlen(p1)) != 0 && strncmp(de->d_name, p2, strlen(p2)) != 0) continue;
+        if (strncmp(de->d_name, p1, strlen(p1)) != 0 && strncmp(de->d_name, p2, strlen(p2)) != 0 &&
+            strncmp(de->d_name, p3, strlen(p3)) != 0) continue;
         char full[1400];
         int n = snprintf(full, sizeof full, "%s/%s", g_data_dir, de->d_name);
         if (n < 0 || (size_t)n >= sizeof full) continue;
@@ -1893,6 +1895,9 @@ typedef struct {
 } Conn;
 
 static Conn g_conns[MAX_CONNS];
+/* Bumped on every accept into a slot: poll results gathered before an eviction
+   must not be applied to the new connection in that slot (fd numbers are reused). */
+static unsigned g_conn_gen[MAX_CONNS];
 
 /* Слот соединения переиспользуется многократно (см. MAX_CONNS). Small rx/tx
    buffers (up to BUF_KEEP_CAP) stay with the slot for the next client, which
@@ -3016,6 +3021,7 @@ static void accept_clients(int lfd) {
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         Conn *c = &g_conns[free_slot];
         conn_clear_keep_buffers(c);   /* keeps the slot's small buffers (see above) */
+        g_conn_gen[free_slot]++;
         c->fd = cfd;
         c->in_use = 1;
         c->is_local = is_local;
@@ -3132,6 +3138,7 @@ int main(int argc, char **argv) {
     while (!g_should_exit) {
         struct pollfd pfds[1 + MAX_CONNS];
         Conn *conn_for_pfd[1 + MAX_CONNS];
+        unsigned gen_for_pfd[1 + MAX_CONNS];
         int nfds = 0;
         pfds[nfds].fd = lfd; pfds[nfds].events = POLLIN; conn_for_pfd[nfds] = NULL; nfds++;
         for (int i = 0; i < MAX_CONNS; i++) {
@@ -3142,6 +3149,7 @@ int main(int argc, char **argv) {
             pfds[nfds].events = events;
             pfds[nfds].revents = 0;
             conn_for_pfd[nfds] = &g_conns[i];
+            gen_for_pfd[nfds] = g_conn_gen[i];
             nfds++;
         }
 
@@ -3178,7 +3186,7 @@ int main(int argc, char **argv) {
 
         for (int k = 1; k < nfds; k++) {
             Conn *c = conn_for_pfd[k];
-            if (!c || !c->in_use || c->fd != pfds[k].fd) continue;
+            if (!c || !c->in_use || gen_for_pfd[k] != g_conn_gen[c - g_conns]) continue;
             if (pfds[k].revents & (POLLHUP | POLLERR | POLLNVAL)) { conn_reset(c); continue; }
             if (pfds[k].revents & POLLIN) {
                 conn_on_readable(c);
