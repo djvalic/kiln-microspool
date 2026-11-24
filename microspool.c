@@ -29,6 +29,7 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #include "vendor/cJSON.h"
 
@@ -68,7 +69,10 @@
 #define BUF_KEEP_CAP          16384             /* per-slot buffers up to this size are reused */
 #define WS_TX_LIMIT           (256 * 1024)      /* unsent bytes per websocket peer before it is dropped */
 #define TX_TOTAL_LIMIT        (8 * 1024 * 1024) /* all send buffers together */
-#define USE_FLUSH_INTERVAL_S  30
+#define USE_FLUSH_INTERVAL_S  5     /* deferred "use" saves: at most this much usage lost on power cut */
+#define SAVE_RETRY_S          1.0   /* retry interval after a failed save (disk full, read-only) */
+#define SAVE_BURST            5     /* LAN write requests saved at once before rate limiting */
+#define SAVE_TOKEN_S          1.0   /* then one save per this many seconds for LAN clients */
 
 /* Версия Spoolman API, которую мы изображаем в /api/v1/info (клиенты сверяют), и собственная версия. */
 static int g_ws_ping_interval = WS_PING_INTERVAL_S;
@@ -313,10 +317,29 @@ static int g_next_vendor_id = 1;
 static int g_next_filament_id = 1;
 static int g_next_spool_id = 1;
 
-static int g_data_dirty_immediate = 0;   /* нужен немедленный сброс на диск */
-static int g_use_pending = 0;            /* есть отложенное изменение use */
-static double g_last_use_flush_mono = 0; /* когда последний раз сбрасывали use */
-static double g_use_flush_deadline = 0;  /* когда сбросить отложенное use */
+/* Saving. Create/patch/delete are written before the client gets its answer
+   (200 only once the change is on disk, 500 and rolled back if the write
+   fails). Use reports from Moonraker (every few seconds while printing) only
+   mark the data dirty and are flushed USE_FLUSH_INTERVAL_S after the first
+   unsaved one, on SIGHUP and on exit. A failed save keeps the data dirty and is
+   retried every SAVE_RETRY_S. */
+static int    g_dirty = 0;           /* unsaved changes in memory */
+static double g_save_due = 0;        /* when the background save runs (valid if g_dirty) */
+static double g_last_fail_log = -1e9;
+static int    g_main_damaged = 0;    /* loaded from .bak: keep the damaged main file as .corrupt */
+static char   g_data_dir[1024] = "."; /* directory of g_data_path, for fsync and cleanup */
+static char   g_bak_path[1100];
+static char   g_corrupt_path[1100];
+
+/* Write-rate limit for LAN clients: a burst of SAVE_BURST synchronous saves,
+   then one per SAVE_TOKEN_S. A LAN request that would save while the bucket
+   is empty waits (CS_HTTP_HELD) until a token is free, so a client looping
+   PATCH cannot make us rewrite and fsync the file hundreds of times a second
+   (eMMC wear). Local clients (Moonraker, HelixScreen) are never held. The
+   cost is latency for a LAN client doing more than SAVE_BURST writes in a row:
+   about one answer per second after the burst. */
+static double g_save_tokens = SAVE_BURST;
+static double g_tokens_mono = 0;
 
 /* ------------------------------------------------------------------------ */
 /* Вспомогательные функции по сущностям                                    */
@@ -350,6 +373,50 @@ static Spool *spool_free_slot(void) {
     for (int i = 0; i < MAX_SPOOLS; i++) if (g_spools[i].id == 0) return &g_spools[i];
     return NULL;
 }
+
+/* Undo log for one write request: handlers record each record before changing
+   it, and if the save that follows fails, everything is put back so the client's
+   500 means "nothing changed". A vendor delete touches at most every filament. */
+typedef struct { void *slot; void *copy; size_t size; } UndoEntry;
+static UndoEntry g_undo[2 + MAX_FILAMENTS];
+static int g_undo_n = 0, g_undo_active = 0;
+static int g_undo_next_ids[3];
+
+static void undo_begin(void) {
+    g_undo_n = 0;
+    g_undo_active = 1;
+    g_undo_next_ids[0] = g_next_vendor_id;
+    g_undo_next_ids[1] = g_next_filament_id;
+    g_undo_next_ids[2] = g_next_spool_id;
+}
+
+/* -1 = out of memory (the handler must fail without changing anything). */
+static int undo_record(void *slot, size_t size) {
+    if (!g_undo_active) return 0;
+    if (g_undo_n >= (int)(sizeof g_undo / sizeof g_undo[0])) return -1;
+    void *copy = malloc(size);
+    if (!copy) return -1;
+    memcpy(copy, slot, size);
+    g_undo[g_undo_n].slot = slot; g_undo[g_undo_n].copy = copy; g_undo[g_undo_n].size = size;
+    g_undo_n++;
+    return 0;
+}
+
+static void undo_end(int rollback) {
+    for (int i = g_undo_n - 1; i >= 0; i--) {
+        if (rollback) memcpy(g_undo[i].slot, g_undo[i].copy, g_undo[i].size);
+        free(g_undo[i].copy);
+    }
+    if (rollback && g_undo_active) {
+        g_next_vendor_id = g_undo_next_ids[0];
+        g_next_filament_id = g_undo_next_ids[1];
+        g_next_spool_id = g_undo_next_ids[2];
+    }
+    g_undo_n = 0;
+    g_undo_active = 0;
+}
+
+#define UNDO_OR_FAIL(p) do { if (undo_record((p), sizeof *(p)) != 0) { snprintf(msg, msgsz, "out of memory"); return 503; } } while (0)
 
 /* сортировка списков по id по возрастанию (для стабильного порядка выдачи) */
 static int cmp_int(const void *a, const void *b) {
@@ -659,26 +726,82 @@ static int load_spool_raw(const cJSON *o, Spool *s) {
     return 0;
 }
 
-/* Атомарная запись: временный файл рядом + fsync + rename. */
-static int write_file_atomic(const char *path, const char *data, size_t len) {
-    char tmp[1024];
-    int n = snprintf(tmp, sizeof tmp, "%s.tmp-%d", path, (int)getpid());
-    if (n < 0 || (size_t)n >= sizeof tmp) return -1;
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
-    size_t off = 0;
-    while (off < len) {
-        ssize_t w = write(fd, data + off, len - off);
-        if (w < 0) { if (errno == EINTR) continue; close(fd); unlink(tmp); return -1; }
-        off += (size_t)w;
-    }
-    if (fsync(fd) != 0) { close(fd); unlink(tmp); return -1; }
-    if (close(fd) != 0) { unlink(tmp); return -1; }
-    if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
-    return 0;
+/* fsync of the directory makes the rename itself durable. */
+static int fsync_data_dir(void) {
+    int dfd = open(g_data_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd < 0) return -1;
+    int rc = fsync(dfd);
+    if (rc != 0 && (errno == EINVAL || errno == ENOTSUP)) rc = 0;   /* fs without directory fsync */
+    int e = errno;
+    close(dfd);
+    errno = e;
+    return rc;
 }
 
-static void save_data(void) {
+/* Writes data to a new file `tmp` (O_EXCL|O_NOFOLLOW: never follows a planted
+   symlink or reuses someone else's file) and fsyncs it. */
+static int write_new_file(const char *tmp, const char *data, size_t len) {
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    if (fd < 0 && errno == EEXIST) {
+        /* left over from a crashed process with our pid: ours to remove */
+        if (unlink(tmp) != 0) return -1;
+        fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0644);
+    }
+    if (fd < 0) return -1;
+    size_t off = 0;
+    int e;
+    while (off < len) {
+        ssize_t w = write(fd, data + off, len - off);
+        if (w < 0) { if (errno == EINTR) continue; goto fail; }
+        off += (size_t)w;
+    }
+    if (fsync(fd) != 0) goto fail;
+    if (close(fd) != 0) { e = errno; unlink(tmp); errno = e; return -1; }
+    return 0;
+fail:
+    e = errno;
+    close(fd);
+    unlink(tmp);
+    errno = e;
+    return -1;
+}
+
+/* Атомарная запись: временный файл рядом + fsync + rename + fsync каталога. */
+static int write_file_atomic(const char *path, const char *data, size_t len) {
+    char tmp[1200];
+    int n = snprintf(tmp, sizeof tmp, "%s.tmp-%d", path, (int)getpid());
+    if (n < 0 || (size_t)n >= sizeof tmp) { errno = ENAMETOOLONG; return -1; }
+    if (write_new_file(tmp, data, len) != 0) return -1;
+    if (rename(tmp, path) != 0) { int e = errno; unlink(tmp); errno = e; return -1; }
+    return fsync_data_dir();
+}
+
+static char *read_file_all(const char *path, size_t *out_len);
+
+/* Before the main file is replaced, its current version becomes <datafile>.bak:
+   a hard link to the same inode, renamed over the old .bak, so the step is
+   atomic and copies nothing. Filesystems without hard links get a copy. If the
+   main file is the damaged one we did not load (g_main_damaged), it is kept as
+   <datafile>.corrupt instead and the .bak we loaded stays as it is. */
+static void keep_previous_version(void) {
+    const char *dst = g_main_damaged ? g_corrupt_path : g_bak_path;
+    char tmp[1200];
+    int n = snprintf(tmp, sizeof tmp, "%s.tmp-%d", dst, (int)getpid());
+    if (n < 0 || (size_t)n >= sizeof tmp) return;
+    unlink(tmp);
+    if (link(g_data_path, tmp) == 0) {
+        if (rename(tmp, dst) != 0) unlink(tmp);
+        return;
+    }
+    if (errno == ENOENT) return;   /* first save: nothing to keep */
+    size_t len = 0;
+    char *old = read_file_all(g_data_path, &len);
+    if (old) { write_file_atomic(dst, old, len); free(old); }
+}
+
+/* Serializes everything and writes it. 0 = on disk; -1 = failed, data stays
+   dirty and is retried in SAVE_RETRY_S. */
+static int save_data(void) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "version", 1);
     cJSON *nid = cJSON_CreateObject();
@@ -701,16 +824,41 @@ static void save_data(void) {
 
     char *text = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!text) { fprintf(stderr, "microspool: ошибка сериализации данных для сохранения\n"); return; }
-    if (write_file_atomic(g_data_path, text, strlen(text)) != 0) {
-        fprintf(stderr, "microspool: не удалось сохранить %s: %s\n", g_data_path, strerror(errno));
+    int rc = -1;
+    if (!text) {
+        errno = ENOMEM;
+    } else {
+        keep_previous_version();
+        rc = write_file_atomic(g_data_path, text, strlen(text));
+    }
+    double now = mono_now();
+    if (rc != 0) {
+        /* don't flood the log while the disk stays full */
+        if (now - g_last_fail_log >= 60) {
+            fprintf(stderr, "microspool: не удалось сохранить %s: %s (will retry)\n", g_data_path, strerror(errno));
+            g_last_fail_log = now;
+        }
+        g_dirty = 1;
+        g_save_due = now + SAVE_RETRY_S;
     } else {
         log_v("сохранено %s (%zu байт)", g_data_path, strlen(text));
+        if (g_last_fail_log > -1e9) {
+            fprintf(stderr, "microspool: saved %s again after earlier failures\n", g_data_path);
+            g_last_fail_log = -1e9;
+        }
+        g_main_damaged = 0;
+        g_dirty = 0;
     }
     free(text);
-    g_data_dirty_immediate = 0;
-    g_use_pending = 0;
-    g_last_use_flush_mono = mono_now();
+    return rc;
+}
+
+/* Deferred save (use reports): due USE_FLUSH_INTERVAL_S after the first unsaved change. */
+static void mark_dirty_deferred(void) {
+    if (!g_dirty) {
+        g_dirty = 1;
+        g_save_due = mono_now() + USE_FLUSH_INTERVAL_S;
+    }
 }
 
 /* next_id from the data file; out-of-range values fall back to 1 (the max-id
@@ -739,30 +887,47 @@ static char *read_file_all(const char *path, size_t *out_len) {
     return buf;
 }
 
-/* Загружает данные с диска. Возвращает 0 при успехе (в т.ч. если файла нет),
-   -1 если файл есть, но повреждён/некорректной структуры (не трогаем файл). */
-static int load_data(void) {
+static void clear_all_records(void) {
+    memset(g_vendors, 0, sizeof g_vendors);
+    memset(g_filaments, 0, sizeof g_filaments);
+    memset(g_spools, 0, sizeof g_spools);
+    g_next_vendor_id = g_next_filament_id = g_next_spool_id = 1;
+}
+
+/* Loads one data file into memory (never writes). Returns 0 = loaded,
+   1 = does not exist (ENOENT only), -1 = damaged, -2 = cannot be read
+   (permissions, I/O error: not the same as "no database"). On anything but 0
+   the records are left empty. */
+static int load_data_inner(const char *path);
+static int load_data_file(const char *path) {
+    int rc = load_data_inner(path);
+    if (rc != 0) clear_all_records();
+    return rc;
+}
+
+static int load_data_inner(const char *path) {
     struct stat st;
-    if (stat(g_data_path, &st) != 0) {
-        log_v("файл данных %s не найден, стартуем с пустой базой", g_data_path);
-        return 0;
+    if (stat(path, &st) != 0) {
+        if (errno == ENOENT) return 1;
+        fprintf(stderr, "microspool: cannot access %s: %s\n", path, strerror(errno));
+        return -2;
     }
     size_t len = 0;
-    char *text = read_file_all(g_data_path, &len);
+    char *text = read_file_all(path, &len);
     if (!text) {
-        fprintf(stderr, "microspool: не удалось прочитать %s: %s\n", g_data_path, strerror(errno));
-        return -1;
+        fprintf(stderr, "microspool: не удалось прочитать %s: %s\n", path, strerror(errno));
+        return -2;
     }
     cJSON *root = cJSON_Parse(text);
     free(text);
     if (!root || !cJSON_IsObject(root)) {
-        fprintf(stderr, "microspool: файл данных %s повреждён (невалидный JSON)\n", g_data_path);
+        fprintf(stderr, "microspool: файл данных %s повреждён (невалидный JSON)\n", path);
         if (root) cJSON_Delete(root);
         return -1;
     }
     cJSON *ver = cJSON_GetObjectItemCaseSensitive(root, "version");
     if (!cJSON_IsNumber(ver) || ver->valueint != 1) {
-        fprintf(stderr, "microspool: файл данных %s имеет неизвестную версию формата\n", g_data_path);
+        fprintf(stderr, "microspool: файл данных %s имеет неизвестную версию формата\n", path);
         cJSON_Delete(root);
         return -1;
     }
@@ -771,13 +936,11 @@ static int load_data(void) {
     cJSON *fs = cJSON_GetObjectItemCaseSensitive(root, "filaments");
     cJSON *sp = cJSON_GetObjectItemCaseSensitive(root, "spools");
     if (!cJSON_IsObject(nid) || !cJSON_IsArray(vs) || !cJSON_IsArray(fs) || !cJSON_IsArray(sp)) {
-        fprintf(stderr, "microspool: файл данных %s повреждён (нет ожидаемых полей)\n", g_data_path);
+        fprintf(stderr, "microspool: файл данных %s повреждён (нет ожидаемых полей)\n", path);
         cJSON_Delete(root);
         return -1;
     }
-    memset(g_vendors, 0, sizeof g_vendors);
-    memset(g_filaments, 0, sizeof g_filaments);
-    memset(g_spools, 0, sizeof g_spools);
+    clear_all_records();
 
     int i = 0;
     cJSON *item;
@@ -819,8 +982,59 @@ static int load_data(void) {
     for (int k = 0; k < MAX_SPOOLS; k++) if (g_spools[k].id >= g_next_spool_id) g_next_spool_id = g_spools[k].id + 1;
 
     cJSON_Delete(root);
-    log_v("загружено %s", g_data_path);
+    log_v("загружено %s", path);
     return 0;
+}
+
+/* Startup load: the main file, or <datafile>.bak if the main file is damaged.
+   If both are bad, refuse to start and change neither file. */
+static int load_data(void) {
+    int rc = load_data_file(g_data_path);
+    if (rc == 0) return 0;
+    if (rc == 1) {
+        log_v("файл данных %s не найден, стартуем с пустой базой", g_data_path);
+        return 0;
+    }
+    if (rc == -2) return -1;
+    fprintf(stderr,
+        "microspool: ********************************************************\n"
+        "microspool: WARNING: data file %s is damaged, trying the backup %s\n", g_data_path, g_bak_path);
+    int brc = load_data_file(g_bak_path);
+    if (brc == 0) {
+        fprintf(stderr,
+            "microspool: WARNING: loaded the previous version from %s.\n"
+            "microspool: WARNING: changes made after it was written are lost.\n"
+            "microspool: WARNING: the damaged file will be kept as %s.\n"
+            "microspool: ********************************************************\n",
+            g_bak_path, g_corrupt_path);
+        g_main_damaged = 1;
+        g_dirty = 1;            /* repair the main file right away */
+        g_save_due = 0;
+        return 0;
+    }
+    fprintf(stderr, "microspool: backup %s is %s; refusing to start, neither file was changed\n",
+            g_bak_path, brc == 1 ? "missing" : "unusable too");
+    return -1;
+}
+
+/* Removes <datafile>.tmp-* and <datafile>.bak.tmp-* left by a crash. */
+static void remove_stale_temp_files(void) {
+    const char *slash = strrchr(g_data_path, '/');
+    const char *base = slash ? slash + 1 : g_data_path;
+    char p1[300], p2[300];
+    snprintf(p1, sizeof p1, "%s.tmp-", base);
+    snprintf(p2, sizeof p2, "%s.bak.tmp-", base);
+    DIR *d = opendir(g_data_dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strncmp(de->d_name, p1, strlen(p1)) != 0 && strncmp(de->d_name, p2, strlen(p2)) != 0) continue;
+        char full[1400];
+        int n = snprintf(full, sizeof full, "%s/%s", g_data_dir, de->d_name);
+        if (n < 0 || (size_t)n >= sizeof full) continue;
+        if (unlink(full) == 0) log_v("removed stale temporary file %s", full);
+    }
+    closedir(d);
 }
 
 /* Рассылка события всем WebSocket-клиентам; определена в сетевой секции ниже,
@@ -967,6 +1181,7 @@ static int vendor_create(const cJSON *input, cJSON **body_out, char *msg, size_t
     Vendor tmp; memset(&tmp, 0, sizeof tmp);
     if (vendor_apply_fields(input, &tmp, 1, msg, msgsz) != 0) return 400;
     if (g_next_vendor_id >= INT_MAX) { snprintf(msg, msgsz, "vendor ids exhausted"); return 400; }
+    UNDO_OR_FAIL(slot);
     tmp.id = g_next_vendor_id++;
     now_iso(tmp.registered, sizeof tmp.registered);
     *slot = tmp;
@@ -997,6 +1212,7 @@ static int vendor_patch(int id, const cJSON *input, cJSON **body_out, char *msg,
     if (!v) { snprintf(msg, msgsz, "vendor %d not found", id); return 404; }
     Vendor tmp = *v;
     if (vendor_apply_fields(input, &tmp, 0, msg, msgsz) != 0) return 400;
+    UNDO_OR_FAIL(v);
     *v = tmp;
     *body_out = vendor_json(v);
     return 0;
@@ -1005,6 +1221,10 @@ static int vendor_patch(int id, const cJSON *input, cJSON **body_out, char *msg,
 static int vendor_delete(int id, cJSON **body_out, char *msg, size_t msgsz) {
     Vendor *v = vendor_find(id);
     if (!v) { snprintf(msg, msgsz, "vendor %d not found", id); return 404; }
+    for (int i = 0; i < MAX_FILAMENTS; i++)
+        if (g_filaments[i].id && g_filaments[i].has_vendor_id && g_filaments[i].vendor_id == id)
+            UNDO_OR_FAIL(&g_filaments[i]);
+    UNDO_OR_FAIL(v);
     cJSON *deleted = vendor_json(v);
     for (int i = 0; i < MAX_FILAMENTS; i++) {
         if (g_filaments[i].id && g_filaments[i].has_vendor_id && g_filaments[i].vendor_id == id) {
@@ -1138,6 +1358,7 @@ static int filament_create(const cJSON *input, cJSON **body_out, char *msg, size
     Filament tmp; memset(&tmp, 0, sizeof tmp);
     if (filament_apply_fields(input, &tmp, 1, msg, msgsz) != 0) return 400;
     if (g_next_filament_id >= INT_MAX) { snprintf(msg, msgsz, "filament ids exhausted"); return 400; }
+    UNDO_OR_FAIL(slot);
     tmp.id = g_next_filament_id++;
     now_iso(tmp.registered, sizeof tmp.registered);
     *slot = tmp;
@@ -1168,6 +1389,7 @@ static int filament_patch(int id, const cJSON *input, cJSON **body_out, char *ms
     if (!f) { snprintf(msg, msgsz, "filament %d not found", id); return 404; }
     Filament tmp = *f;
     if (filament_apply_fields(input, &tmp, 0, msg, msgsz) != 0) return 400;
+    UNDO_OR_FAIL(f);
     *f = tmp;
     *body_out = filament_response_json(f);
     return 0;
@@ -1182,6 +1404,7 @@ static int filament_delete(int id, cJSON **body_out, char *msg, size_t msgsz) {
             return 400;
         }
     }
+    UNDO_OR_FAIL(f);
     cJSON *deleted = filament_response_json(f);
     memset(f, 0, sizeof *f);
     *body_out = deleted;
@@ -1300,6 +1523,7 @@ static int spool_create(const cJSON *input, cJSON **body_out, char *msg, size_t 
     strcpy(tmp.extra, "{}");
     if (spool_apply_fields(input, &tmp, 1, msg, msgsz) != 0) return 400;
     if (g_next_spool_id >= INT_MAX) { snprintf(msg, msgsz, "spool ids exhausted"); return 400; }
+    UNDO_OR_FAIL(slot);
     tmp.id = g_next_spool_id++;
     now_iso(tmp.registered, sizeof tmp.registered);
     *slot = tmp;
@@ -1334,6 +1558,7 @@ static int spool_patch(int id, const cJSON *input, cJSON **body_out, char *msg, 
     if (!s) { snprintf(msg, msgsz, "spool %d not found", id); return 404; }
     Spool tmp = *s;
     if (spool_apply_fields(input, &tmp, 0, msg, msgsz) != 0) return 400;
+    UNDO_OR_FAIL(s);
     *s = tmp;
     *body_out = spool_response_json(s);
     return 0;
@@ -1342,6 +1567,7 @@ static int spool_patch(int id, const cJSON *input, cJSON **body_out, char *msg, 
 static int spool_delete(int id, cJSON **body_out, char *msg, size_t msgsz) {
     Spool *s = spool_find(id);
     if (!s) { snprintf(msg, msgsz, "spool %d not found", id); return 404; }
+    UNDO_OR_FAIL(s);
     cJSON *deleted = spool_response_json(s);
     memset(s, 0, sizeof *s);
     *body_out = deleted;
@@ -1542,7 +1768,8 @@ static int query_allow_archived(const char *raw_path_with_query) {
 /* Соединения: состояние, буферы, ввод-вывод                                */
 /* ------------------------------------------------------------------------ */
 
-typedef enum { CS_HTTP_HEADERS, CS_HTTP_BODY, CS_HTTP_CLOSING, CS_WS } conn_state_t;
+/* CS_HTTP_HELD: complete LAN write request waiting for a save token (see g_save_tokens). */
+typedef enum { CS_HTTP_HEADERS, CS_HTTP_BODY, CS_HTTP_HELD, CS_HTTP_CLOSING, CS_WS } conn_state_t;
 
 typedef struct {
     int fd;
@@ -1886,18 +2113,38 @@ static void ws_broadcast_event(const char *type, const char *resource, cJSON *pa
 }
 
 /* ------------------------------------------------------------------------ */
-/* Отложенный сброс данных для PUT .../use                                  */
+/* Write requests: save first, answer after                                 */
 /* ------------------------------------------------------------------------ */
 
-static void schedule_use_flush(void) {
-    double now = mono_now();
-    if (now - g_last_use_flush_mono >= USE_FLUSH_INTERVAL_S) {
-        save_data();
-    } else {
-        g_use_pending = 1;
-        double candidate = g_last_use_flush_mono + USE_FLUSH_INTERVAL_S;
-        if (!g_use_flush_deadline || candidate < g_use_flush_deadline) g_use_flush_deadline = candidate;
+static void save_tokens_refill(double now) {
+    g_save_tokens += (now - g_tokens_mono) / SAVE_TOKEN_S;
+    if (g_save_tokens > SAVE_BURST) g_save_tokens = SAVE_BURST;
+    g_tokens_mono = now;
+}
+
+/* Finishes a create/patch/delete started with undo_begin(): rc != 0 is the
+   handler's error; otherwise the data is saved and only then answered 200 (and
+   broadcast). If the save fails, the change is rolled back and the client gets
+   500, so a retry cannot create duplicates. */
+static void finish_write(Conn *c, int rc, cJSON *out, const char *msg, const char *ev_type, const char *ev_resource) {
+    if (rc) {
+        undo_end(1);
+        if (out) cJSON_Delete(out);
+        http_send_error(c, rc, msg);
+        return;
     }
+    if (!c->is_local) { save_tokens_refill(mono_now()); g_save_tokens -= 1; }
+    g_dirty = 1;
+    if (save_data() != 0) {
+        undo_end(1);
+        cJSON_Delete(out);
+        http_send_error(c, 500, "could not save the data file; the change was not applied");
+        return;
+    }
+    undo_end(0);
+    cJSON *bcast = ev_type ? cJSON_Duplicate(out, 1) : NULL;
+    http_send_json(c, 200, out, -1);
+    if (bcast) ws_broadcast_event(ev_type, ev_resource, bcast);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2052,9 +2299,9 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
             http_send_json(c, 200, arr, cnt);
         } else if (strcmp(m->method, "POST") == 0) {
             cJSON *out = NULL; char msg[300];
+            undo_begin();
             int rc = vendor_create(input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg);
-            else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, NULL, "vendor");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -2072,11 +2319,13 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
             rc = vendor_get(id, &out, msg, sizeof msg);
             if (rc) http_send_error(c, rc, msg); else http_send_json(c, 200, out, -1);
         } else if (strcmp(m->method, "PATCH") == 0) {
+            undo_begin();
             rc = vendor_patch(id, input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg); else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, NULL, "vendor");
         } else if (strcmp(m->method, "DELETE") == 0) {
+            undo_begin();
             rc = vendor_delete(id, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg); else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, NULL, "vendor");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -2089,9 +2338,9 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
             http_send_json(c, 200, arr, cnt);
         } else if (strcmp(m->method, "POST") == 0) {
             cJSON *out = NULL; char msg[300];
+            undo_begin();
             int rc = filament_create(input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg);
-            else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, NULL, "filament");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -2109,11 +2358,13 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
             rc = filament_get(id, &out, msg, sizeof msg);
             if (rc) http_send_error(c, rc, msg); else http_send_json(c, 200, out, -1);
         } else if (strcmp(m->method, "PATCH") == 0) {
+            undo_begin();
             rc = filament_patch(id, input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg); else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, NULL, "filament");
         } else if (strcmp(m->method, "DELETE") == 0) {
+            undo_begin();
             rc = filament_delete(id, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg); else { http_send_json(c, 200, out, -1); save_data(); }
+            finish_write(c, rc, out, msg, NULL, "filament");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -2127,14 +2378,9 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
             http_send_json(c, 200, arr, cnt);
         } else if (strcmp(m->method, "POST") == 0) {
             cJSON *out = NULL; char msg[300];
+            undo_begin();
             int rc = spool_create(input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg);
-            else {
-                cJSON *bcast = cJSON_Duplicate(out, 1);
-                http_send_json(c, 200, out, -1);
-                save_data();
-                ws_broadcast_event("added", "spool", bcast);
-            }
+            finish_write(c, rc, out, msg, "added", "spool");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -2162,12 +2408,14 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         cJSON *out = NULL; char msg[300]; int rc;
         if (is_use) {
             if (strcmp(m->method, "PUT") != 0) { http_send_error(c, 405, "method not allowed"); goto done; }
+            /* Use reports stay deferred: Moonraker sends one every few seconds
+               while printing; saving each would wear the eMMC. */
             rc = spool_use(id, input, &out, msg, sizeof msg);
             if (rc) http_send_error(c, rc, msg);
             else {
                 cJSON *bcast = cJSON_Duplicate(out, 1);
                 http_send_json(c, 200, out, -1);
-                schedule_use_flush();
+                mark_dirty_deferred();
                 ws_broadcast_event("updated", "spool", bcast);
             }
             goto done;
@@ -2176,23 +2424,13 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
             rc = spool_get(id, &out, msg, sizeof msg);
             if (rc) http_send_error(c, rc, msg); else http_send_json(c, 200, out, -1);
         } else if (strcmp(m->method, "PATCH") == 0) {
+            undo_begin();
             rc = spool_patch(id, input, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg);
-            else {
-                cJSON *bcast = cJSON_Duplicate(out, 1);
-                http_send_json(c, 200, out, -1);
-                save_data();
-                ws_broadcast_event("updated", "spool", bcast);
-            }
+            finish_write(c, rc, out, msg, "updated", "spool");
         } else if (strcmp(m->method, "DELETE") == 0) {
+            undo_begin();
             rc = spool_delete(id, &out, msg, sizeof msg);
-            if (rc) http_send_error(c, rc, msg);
-            else {
-                cJSON *bcast = cJSON_Duplicate(out, 1);
-                http_send_json(c, 200, out, -1);
-                save_data();
-                ws_broadcast_event("deleted", "spool", bcast);
-            }
+            finish_write(c, rc, out, msg, "deleted", "spool");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -2343,6 +2581,37 @@ static int request_rejected(Conn *c, const HttpRequestMeta *m) {
 /* Обработка входящих байт на HTTP-соединении                               */
 /* ------------------------------------------------------------------------ */
 
+static void conn_dispatch(Conn *c) {
+    const char *body = c->rx + c->header_body_offset;
+    route_and_dispatch(c, &c->meta, body, (size_t)c->content_length);
+    c->state = CS_HTTP_CLOSING;
+    conn_try_flush(c);
+}
+
+/* Requests that save synchronously (everything that writes except use reports). */
+static int request_may_save(const HttpRequestMeta *m) {
+    if (str_ieq(m->method, "GET") || str_ieq(m->method, "HEAD")) return 0;
+    char path[1024];
+    split_path(m->path, path, sizeof path);
+    size_t n = strlen(path);
+    return !(n >= 4 && strcmp(path + n - 4, "/use") == 0);
+}
+
+/* Runs held LAN write requests, oldest first, while save tokens last. */
+static void dispatch_held_requests(double now) {
+    for (;;) {
+        save_tokens_refill(now);
+        if (g_save_tokens < 1) return;
+        Conn *next = NULL;
+        for (int i = 0; i < MAX_CONNS; i++) {
+            Conn *c = &g_conns[i];
+            if (c->in_use && c->state == CS_HTTP_HELD && (!next || c->accepted_mono < next->accepted_mono)) next = c;
+        }
+        if (!next) return;
+        conn_dispatch(next);
+    }
+}
+
 static void process_http_buffer(Conn *c) {
     if (c->state == CS_HTTP_HEADERS) {
         const char *hdr_end = find_header_end(c->rx, c->rx_len);
@@ -2414,10 +2683,11 @@ static void process_http_buffer(Conn *c) {
     if (c->state == CS_HTTP_BODY) {
         size_t need = c->header_body_offset + (size_t)c->content_length;
         if (c->rx_len < need) return;
-        const char *body = c->rx + c->header_body_offset;
-        route_and_dispatch(c, &c->meta, body, (size_t)c->content_length);
-        c->state = CS_HTTP_CLOSING;
-        conn_try_flush(c);
+        if (!c->is_local && request_may_save(&c->meta)) {
+            save_tokens_refill(mono_now());
+            if (g_save_tokens < 1) { c->state = CS_HTTP_HELD; return; }
+        }
+        conn_dispatch(c);
     }
 }
 
@@ -2431,7 +2701,7 @@ static void conn_on_readable(Conn *c) {
                 ws_feed(c, buf, (size_t)r);
                 conn_try_flush(c);
                 if (!c->in_use) return;
-            } else if (c->state == CS_HTTP_CLOSING) {
+            } else if (c->state == CS_HTTP_CLOSING || c->state == CS_HTTP_HELD) {
                 /* The request is complete and answered: read and drop whatever else
                    arrives (bounded by the request deadline) instead of growing rx. */
             } else {
@@ -2448,7 +2718,7 @@ static void conn_on_readable(Conn *c) {
             }
             if ((size_t)r < sizeof buf) break;
         } else if (r == 0) {
-            if (c->state == CS_HTTP_CLOSING && c->tx_len > c->tx_sent) {
+            if ((c->state == CS_HTTP_CLOSING && c->tx_len > c->tx_sent) || c->state == CS_HTTP_HELD) {
                 c->rd_eof = 1;   /* half-closed after the request: still deliver the answer */
                 return;
             }
@@ -2586,7 +2856,25 @@ static void accept_clients(int lfd) {
 /* main: аргументы, сокет, сигналы, event loop                              */
 /* ------------------------------------------------------------------------ */
 
+static volatile sig_atomic_t g_flush_requested = 0;
 static void on_term_signal(int sig) { (void)sig; g_should_exit = 1; }
+static void on_hup_signal(int sig) { (void)sig; g_flush_requested = 1; }
+
+/* g_data_dir, g_bak_path, g_corrupt_path from g_data_path. */
+static int setup_data_paths(void) {
+    const char *slash = strrchr(g_data_path, '/');
+    if (slash) {
+        size_t n = (size_t)(slash - g_data_path);
+        if (n == 0) n = 1;   /* "/file" -> "/" */
+        if (n >= sizeof g_data_dir) return -1;
+        memcpy(g_data_dir, g_data_path, n);
+        g_data_dir[n] = 0;
+    }
+    int a = snprintf(g_bak_path, sizeof g_bak_path, "%s.bak", g_data_path);
+    int b = snprintf(g_corrupt_path, sizeof g_corrupt_path, "%s.corrupt", g_data_path);
+    if (a < 0 || (size_t)a >= sizeof g_bak_path || b < 0 || (size_t)b >= sizeof g_corrupt_path) return -1;
+    return 0;
+}
 
 static void print_usage(const char *argv0) {
     fprintf(stderr,
@@ -2628,17 +2916,23 @@ int main(int argc, char **argv) {
     g_hostname[sizeof g_hostname - 1] = 0;
     str_lower(g_hostname);
 
+    if (setup_data_paths() != 0) { fprintf(stderr, "microspool: data file path too long\n"); return 1; }
     if (load_data() != 0) {
-        fprintf(stderr, "microspool: файл данных повреждён, выхожу без изменений\n");
+        fprintf(stderr, "microspool: файл данных повреждён или недоступен, выхожу без изменений\n");
         return 1;
     }
-    g_last_use_flush_mono = mono_now();
+    remove_stale_temp_files();
+    g_tokens_mono = mono_now();
 
     struct sigaction sa_term;
     memset(&sa_term, 0, sizeof sa_term);
     sa_term.sa_handler = on_term_signal;
     sigaction(SIGTERM, &sa_term, NULL);
     sigaction(SIGINT, &sa_term, NULL);
+    struct sigaction sa_hup;
+    memset(&sa_hup, 0, sizeof sa_hup);
+    sa_hup.sa_handler = on_hup_signal;
+    sigaction(SIGHUP, &sa_hup, NULL);   /* SIGHUP: save now and keep running */
     signal(SIGPIPE, SIG_IGN);
 
     int lfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -2683,16 +2977,27 @@ int main(int argc, char **argv) {
             double d = conn_next_deadline(&g_conns[i]);
             if (d < next_deadline) next_deadline = d;
         }
-        if (g_use_pending && g_use_flush_deadline < next_deadline) next_deadline = g_use_flush_deadline;
+        if (g_dirty && g_save_due < next_deadline) next_deadline = g_save_due;
+        for (int i = 0; i < MAX_CONNS; i++) {
+            if (g_conns[i].in_use && g_conns[i].state == CS_HTTP_HELD) {
+                double t = now + (1 - g_save_tokens) * SAVE_TOKEN_S;
+                if (t < next_deadline) next_deadline = t;
+                break;
+            }
+        }
         double timeout_s = next_deadline - now;
         if (timeout_s < 0) timeout_s = 0;
         int timeout_ms = (int)(timeout_s * 1000.0) + 1;
 
         int pr = poll(pfds, (nfds_t)nfds, timeout_ms);
         if (pr < 0) {
-            if (errno == EINTR) continue;
-            perror("poll");
-            break;
+            if (errno != EINTR) { perror("poll"); break; }
+            pr = 0;
+            for (int k = 0; k < nfds; k++) pfds[k].revents = 0;
+        }
+        if (g_flush_requested) {
+            g_flush_requested = 0;
+            if (g_dirty) { log_v("SIGHUP: saving"); save_data(); }
         }
 
         if (pfds[0].revents & POLLIN) accept_clients(lfd);
@@ -2714,12 +3019,17 @@ int main(int argc, char **argv) {
         now = mono_now();
         for (int i = 0; i < MAX_CONNS; i++) conn_run_timers(&g_conns[i], now);
 
-        if (g_use_pending && now >= g_use_flush_deadline) save_data();
+        dispatch_held_requests(now);
+        if (g_dirty && now >= g_save_due) save_data();
     }
 
-    save_data();
+    int exit_rc = 0;
+    if (g_dirty && save_data() != 0) {
+        fprintf(stderr, "microspool: could not save %s on exit, recent changes are lost\n", g_data_path);
+        exit_rc = 1;
+    }
     log_v("получен сигнал завершения, данные сохранены");
     for (int i = 0; i < MAX_CONNS; i++) if (g_conns[i].in_use) conn_reset(&g_conns[i]);
     close(lfd);
-    return 0;
+    return exit_rc;
 }

@@ -759,6 +759,232 @@ def test_datafile_id_validation():
         srv.cleanup()
 
 
+def read_json(path):
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_backup_and_fallback():
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        http_json(base, "POST", "/api/v1/vendor", {"name": "First"})
+        check("bak: no .bak after the very first save", not os.path.exists(srv.datafile + ".bak"))
+        http_json(base, "POST", "/api/v1/vendor", {"name": "Second"})
+        bak = read_json(srv.datafile + ".bak")
+        main = read_json(srv.datafile)
+        check("bak: .bak holds the previous version", [v["name"] for v in bak["vendors"]] == ["First"], bak)
+        check("bak: main file holds the current version", [v["name"] for v in main["vendors"]] == ["First", "Second"])
+        srv.stop()
+
+        damaged = '{"version": 1, "vendors": [truncated'
+        with open(srv.datafile, "w", encoding="utf-8") as fh:
+            fh.write(damaged)
+        srv2 = Server(datafile=srv.datafile, tmpdir=srv.tmpdir)
+        srv2.start()
+        status, lst, _ = http_json(srv2.base_url(), "GET", "/api/v1/vendor")
+        check("bak: damaged main file -> starts from .bak", status == 200 and [v["name"] for v in lst] == ["First"], lst)
+        time.sleep(0.3)
+        check("bak: main file repaired from the loaded data",
+              [v["name"] for v in read_json(srv.datafile)["vendors"]] == ["First"])
+        with open(srv.datafile + ".corrupt", "r", encoding="utf-8") as fh:
+            check("bak: damaged main file kept as .corrupt", fh.read() == damaged)
+        check("bak: .bak left as it was", [v["name"] for v in read_json(srv.datafile + ".bak")["vendors"]] == ["First"])
+        rc = srv2.stop()
+        err = srv2.proc.stderr.read().decode(errors="replace")
+        check("bak: fallback is logged loudly", "WARNING" in err and ".bak" in err, err[-300:])
+        check("bak: clean exit after fallback", rc == 0, f"rc={rc}")
+    finally:
+        srv.cleanup()
+
+    srv, rc, err = start_with_datafile("not json", extra_files={"microspool.json.bak": "also not json"})
+    try:
+        check("bak: main and .bak both damaged -> refuses to start (rc 1)", rc == 1, f"rc={rc}")
+        with open(srv.datafile) as a, open(srv.datafile + ".bak") as b:
+            check("bak: neither damaged file was changed", a.read() == "not json" and b.read() == "also not json")
+        check("bak: no .corrupt written when refusing", not os.path.exists(srv.datafile + ".corrupt"))
+    finally:
+        srv.cleanup()
+
+
+def test_unreadable_datafile():
+    if os.geteuid() == 0:
+        print("[SKIP] unreadable data file: running as root, permissions are not enforced")
+        return
+    tmpdir = tempfile.mkdtemp(prefix="microspool_test_perm_")
+    datafile = os.path.join(tmpdir, "microspool.json")
+    with open(datafile, "w") as fh:
+        json.dump(db(vendors=[{"id": 1, "name": "Keep", "registered": "", "extra": {}}]), fh)
+    os.chmod(datafile, 0)
+    srv = Server(datafile=datafile, tmpdir=tmpdir)
+    try:
+        srv.start(wait_ready=False)
+        try:
+            srv.wait_ready(timeout=3)
+            rc = None
+        except RuntimeError:
+            rc = srv.proc.returncode
+        check("data file: unreadable (EACCES) is fatal, not an empty database", rc == 1, f"rc={rc}")
+    finally:
+        os.chmod(datafile, 0o644)
+        srv.cleanup()
+
+
+def test_temp_files():
+    tmpdir = tempfile.mkdtemp(prefix="microspool_test_tmp_")
+    datafile = os.path.join(tmpdir, "microspool.json")
+    for name in ("microspool.json.tmp-99999", "microspool.json.bak.tmp-12", "other.tmp-1"):
+        with open(os.path.join(tmpdir, name), "w") as fh:
+            fh.write("stale")
+    srv = Server(datafile=datafile, tmpdir=tmpdir)
+    try:
+        srv.start()
+        left = sorted(os.listdir(tmpdir))
+        check("tmp: stale <datafile>.tmp-* and .bak.tmp-* removed at start, others kept",
+              "microspool.json.tmp-99999" not in left and "microspool.json.bak.tmp-12" not in left
+              and "other.tmp-1" in left, left)
+        target = os.path.join(tmpdir, "victim")
+        with open(target, "w") as fh:
+            fh.write("untouched")
+        os.symlink(target, f"{datafile}.tmp-{srv.proc.pid}")
+        status, _, _ = http_json(srv.base_url(), "POST", "/api/v1/vendor", {"name": "SymlinkTest"})
+        with open(target) as fh:
+            check("tmp: planted symlink at the temp name is not followed", fh.read() == "untouched")
+        check("tmp: save still succeeds", status == 200 and
+              [v["name"] for v in read_json(datafile)["vendors"]] == ["SymlinkTest"])
+    finally:
+        srv.cleanup()
+
+
+def test_failed_save():
+    if os.geteuid() == 0:
+        print("[SKIP] failed save: running as root, a read-only directory does not stop writes")
+        return
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        status, v, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "Before"})
+        status, f, _ = http_json(base, "POST", "/api/v1/filament", {"density": 1.24, "diameter": 1.75, "weight": 1000})
+        status, sp, _ = http_json(base, "POST", "/api/v1/spool", {"filament_id": f["id"]})
+        os.chmod(srv.tmpdir, 0o555)
+        try:
+            status, body, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "Lost"})
+            check("failed save: POST -> 500", status == 500, f"{status} {body}")
+            status, lst, _ = http_json(base, "GET", "/api/v1/vendor")
+            check("failed save: POST rolled back (not in the list)", [x["name"] for x in lst] == ["Before"], lst)
+            status, _, _ = http_json(base, "PATCH", f"/api/v1/vendor/{v['id']}", {"name": "Renamed"})
+            status2, got, _ = http_json(base, "GET", f"/api/v1/vendor/{v['id']}")
+            check("failed save: PATCH -> 500 and rolled back", status == 500 and got["name"] == "Before", got)
+            status, _, _ = http_json(base, "DELETE", f"/api/v1/vendor/{v['id']}")
+            status2, _, _ = http_json(base, "GET", f"/api/v1/vendor/{v['id']}")
+            check("failed save: DELETE -> 500 and rolled back", status == 500 and status2 == 200)
+            status, nv, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "x"})
+            status, _, _ = http_json(base, "GET", "/api/v1/vendor")
+            status, used, _ = http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 7})
+            check("failed save: deferred use still answers 200", status == 200)
+        finally:
+            os.chmod(srv.tmpdir, 0o755)
+        status, nv, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "After"})
+        check("failed save: ids not burnt by rolled-back creates", status == 200 and nv["id"] == v["id"] + 1, nv)
+        saved = next(x for x in read_json(srv.datafile)["spools"] if x["id"] == sp["id"])
+        check("failed save: use kept dirty and written by the next save", abs(saved["used_weight"] - 7) < 1e-9, saved)
+        srv.stop()
+        err = srv.proc.stderr.read().decode(errors="replace")
+        check("failed save: failure logged once, recovery logged", err.count("will retry") == 1 and "again" in err, err[-400:])
+    finally:
+        os.chmod(srv.tmpdir, 0o755)
+        srv.cleanup()
+
+    # a failed deferred save is retried on its own once the disk is writable again
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        status, f, _ = http_json(base, "POST", "/api/v1/filament", {"density": 1.24, "diameter": 1.75, "weight": 1000})
+        status, sp, _ = http_json(base, "POST", "/api/v1/spool", {"filament_id": f["id"]})
+        os.chmod(srv.tmpdir, 0o555)
+        http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 11})
+        time.sleep(6.0)   # deferred save due after 5 s, fails
+        os.chmod(srv.tmpdir, 0o755)
+        time.sleep(1.5)   # retried within SAVE_RETRY_S
+        saved = next(x for x in read_json(srv.datafile)["spools"] if x["id"] == sp["id"])
+        check("failed save: deferred save retried after the disk recovers", abs(saved["used_weight"] - 11) < 1e-9, saved)
+    finally:
+        os.chmod(srv.tmpdir, 0o755)
+        srv.cleanup()
+
+
+def test_deferred_flush_timing_and_sighup():
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        status, f, _ = http_json(base, "POST", "/api/v1/filament", {"density": 1.24, "diameter": 1.75, "weight": 1000})
+        status, sp, _ = http_json(base, "POST", "/api/v1/spool", {"filament_id": f["id"]})
+        used = lambda: next(x for x in read_json(srv.datafile)["spools"] if x["id"] == sp["id"])["used_weight"]
+        t0 = time.time()
+        http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 5})
+        time.sleep(3.5)
+        http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 5})
+        check("deferred use: not written after 3.5 s", used() == 0)
+        while time.time() - t0 < 7 and used() == 0:
+            time.sleep(0.1)
+        dt = time.time() - t0
+        check("deferred use: written ~5 s after the first unsaved use (not 30 s)",
+              used() == 10 and 4.5 <= dt <= 6.5, f"used={used()} dt={dt:.2f}")
+        http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 1})
+        srv.proc.send_signal(signal.SIGHUP)
+        time.sleep(0.4)
+        check("SIGHUP: pending use saved at once", used() == 11, used())
+        check("SIGHUP: server keeps running", srv.proc.poll() is None and
+              http_json(base, "GET", "/api/v1/health")[0] == 200)
+        http_json(base, "PUT", f"/api/v1/spool/{sp['id']}/use", {"use_weight": 1})
+        rc = srv.stop(signal.SIGINT)
+        check("SIGINT: pending use saved on exit (rc 0)", rc == 0 and used() == 12, f"rc={rc} used={used()}")
+    finally:
+        srv.cleanup()
+
+
+def test_lan_write_rate_limit():
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        status, v, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "Rate"})
+        body = json.dumps({"comment": "x"}).encode()
+        req = (f"PATCH /api/v1/vendor/{v['id']} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+               f"Content-Length: {len(body)}\r\n\r\n").encode() + body
+        mtimes = set()
+        t0 = time.time()
+        codes = []
+        for i in range(8):
+            s = lan_socket(srv.port, "127.0.0.2", timeout=5)
+            s.sendall(req)
+            data = b""
+            try:
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except socket.timeout:
+                pass
+            s.close()
+            codes.append(parse_status(data) if data else None)
+        lan_dt = time.time() - t0
+        check("rate limit: all 8 LAN PATCHes answered 200", codes == [200] * 8, codes)
+        check("rate limit: LAN writes after a burst of 5 slowed to ~1 per second",
+              2.5 <= lan_dt <= 5.0, f"dt={lan_dt:.2f}")
+        t0 = time.time()
+        ok = all(http_json(base, "PATCH", f"/api/v1/vendor/{v['id']}", {"comment": str(i)})[0] == 200 for i in range(10))
+        local_dt = time.time() - t0
+        check("rate limit: local clients (Moonraker) are never held", ok and local_dt < 1.5, f"dt={local_dt:.2f}")
+    finally:
+        srv.cleanup()
+
+
 def test_corrupt_file():
     tmpdir = tempfile.mkdtemp(prefix="microspool_test_corrupt_")
     datafile = os.path.join(tmpdir, "microspool.json")
@@ -1194,6 +1420,12 @@ def main():
     test_persistence()
     test_deferred_use_flush()
     test_corrupt_file()
+    test_backup_and_fallback()
+    test_unreadable_datafile()
+    test_temp_files()
+    test_failed_save()
+    test_deferred_flush_timing_and_sighup()
+    test_lan_write_rate_limit()
     test_input_validation()
     test_datafile_id_validation()
     test_websocket()
