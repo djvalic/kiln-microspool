@@ -313,7 +313,7 @@ def test_spool_crud_and_weights(base, filament_id):
     status, lst3, _ = http_json(base, "GET", "/api/v1/spool?allow_archived=1")
     check("spool: allow_archived=1 содержит архивную", any(x["id"] == arch["id"] for x in lst3))
     status, lst4, hdrs4 = http_json(base, "GET", "/api/v1/spool?limit=1000")
-    check("spool: ?limit=1000 игнорируется, но не ломает запрос", status == 200)
+    check("spool: ?limit=1000 (HelixScreen) -> 200, all spools", status == 200 and len(lst4) == len(lst))
 
     status, deleted, _ = http_json(base, "DELETE", f"/api/v1/spool/{arch['id']}")
     check("spool: DELETE -> 200", status == 200 and deleted["id"] == arch["id"])
@@ -366,6 +366,141 @@ def test_errors_and_limits(base):
 # ---------------------------------------------------------------------------
 # Встроенный веб-интерфейс, /api/v1/setting и списки material/location/lot-number
 # ---------------------------------------------------------------------------
+
+def test_api_gaps():
+    srv = Server()
+    try:
+        srv.start()
+        base = srv.base_url()
+        for ent in ("vendor", "filament", "spool"):
+            status, arr, _ = http_json(base, "GET", f"/api/v1/field/{ent}")
+            check(f"field: GET /api/v1/field/{ent} -> []", status == 200 and arr == [], f"{status} {arr}")
+        status, _, _ = http_json(base, "GET", "/api/v1/field/nope")
+        check("field: unknown entity -> 404", status == 404)
+        status, arr, _ = http_json(base, "POST", "/api/v1/field/filament/pressure_advance",
+                                   {"name": "Pressure advance", "field_type": "float"})
+        check("field: POST definition (HelixScreen) -> 200 with the field",
+              status == 200 and arr and arr[0]["key"] == "pressure_advance" and arr[0]["field_type"] == "float", arr)
+        status, _, _ = http_json(base, "POST", "/api/v1/field/filament/Bad-Key", {"name": "x", "field_type": "text"})
+        check("field: invalid key -> 400", status == 400)
+        status, _, _ = http_json(base, "POST", "/api/v1/field/filament/k", {"name": 1})
+        check("field: POST without name/field_type -> 400", status == 400)
+
+        status, arr, _ = http_json(base, "GET", "/api/v1/external/filament/search?query=pla&limit=20")
+        check("external: /external/filament/search -> []", status == 200 and arr == [], f"{status} {arr}")
+        status, arr, _ = http_json(base, "GET", "/api/v1/external/anything/else")
+        check("external: anything under /external/ -> []", status == 200 and arr == [])
+
+        status, info, _ = http_json(base, "GET", "/api/v1/info")
+        check("info: version stays 0.22.1 (Moonraker/Fluidd check it)", info.get("version") == "0.22.1")
+        check("info: data_dir no longer leaks the absolute path",
+              info.get("data_dir") == "microspool.json" and srv.tmpdir not in json.dumps(info), info)
+
+        status, v1, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "A"})
+        status, v2, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "B"})
+        status, v3, _ = http_json(base, "POST", "/api/v1/vendor", {"name": "C"})
+        status, lst, h = http_json(base, "GET", "/api/v1/vendor?limit=1&offset=1")
+        check("paging: vendor limit=1&offset=1 -> second record",
+              status == 200 and [x["name"] for x in lst] == ["B"], lst)
+        check("paging: X-Total-Count is the total before paging", h.get("X-Total-Count") == "3", h)
+        status, lst, h = http_json(base, "GET", "/api/v1/vendor?offset=5")
+        check("paging: offset past the end -> [] with total", status == 200 and lst == [] and h.get("X-Total-Count") == "3")
+        status, lst, _ = http_json(base, "GET", "/api/v1/vendor?limit=0")
+        check("paging: limit=0 -> []", status == 200 and lst == [])
+        status, lst, _ = http_json(base, "GET", "/api/v1/vendor?limit=1000")
+        check("paging: limit=1000 (HelixScreen) -> all", status == 200 and len(lst) == 3)
+        for q in ("limit=-1", "limit=abc", "offset=-2", "limit="):
+            status, _, _ = http_json(base, "GET", f"/api/v1/vendor?{q}")
+            check(f"paging: {q} -> 400", status == 400)
+
+        mk = lambda vid: http_json(base, "POST", "/api/v1/filament",
+                                   dict({"density": 1.24, "diameter": 1.75, "weight": 1000}, **({"vendor_id": vid} if vid else {})))[1]
+        fa, fb, fn = mk(v1["id"]), mk(v2["id"]), mk(None)
+        status, lst, h = http_json(base, "GET", f"/api/v1/filament?vendor.id={v1['id']}")
+        check("filter: filament?vendor.id=N (HelixScreen) -> only that vendor's",
+              status == 200 and [x["id"] for x in lst] == [fa["id"]] and h.get("X-Total-Count") == "1", lst)
+        status, lst, _ = http_json(base, "GET", f"/api/v1/filament?vendor.id={v1['id']},{v2['id']}")
+        check("filter: vendor.id list", [x["id"] for x in lst] == [fa["id"], fb["id"]], lst)
+        status, lst, _ = http_json(base, "GET", "/api/v1/filament?vendor.id=-1")
+        check("filter: vendor.id=-1 -> filaments without vendor", [x["id"] for x in lst] == [fn["id"]], lst)
+
+        for _ in range(3):
+            http_json(base, "POST", "/api/v1/spool", {"filament_id": fa["id"]})
+        status, lst, h = http_json(base, "GET", "/api/v1/spool?limit=2")
+        check("paging: spool limit=2", status == 200 and len(lst) == 2 and h.get("X-Total-Count") == "3", h)
+        status, lst, _ = http_json(base, "GET", "/api/v1/filament?limit=1&offset=2")
+        check("paging: filament limit/offset", [x["id"] for x in lst] == [fn["id"]], lst)
+    finally:
+        srv.cleanup()
+
+
+async def _ws_subscriptions(base, port):
+    from tornado.websocket import websocket_connect
+    from tornado.httpclient import AsyncHTTPClient, HTTPRequest
+
+    async def sub(path):
+        conn = await websocket_connect(f"ws://127.0.0.1:{port}{path}", connect_timeout=5.0)
+        got = []
+
+        async def reader():
+            while True:
+                msg = await conn.read_message()
+                if msg is None:
+                    return
+                got.append(json.loads(msg))
+        return conn, got, asyncio.ensure_future(reader())
+
+    client = AsyncHTTPClient()
+
+    async def call(method, path, body=None):
+        r = await client.fetch(HTTPRequest(base + path, method=method,
+                                           body=json.dumps(body) if body is not None else None,
+                                           headers={"Content-Type": "application/json"}), raise_error=False)
+        return json.loads(r.body) if r.body else None
+
+    v = await call("POST", "/api/v1/vendor", {"name": "WS"})
+    f = await call("POST", "/api/v1/filament", {"vendor_id": v["id"], "density": 1.24, "diameter": 1.75, "weight": 1000})
+    s1 = await call("POST", "/api/v1/spool", {"filament_id": f["id"]})
+    s2 = await call("POST", "/api/v1/spool", {"filament_id": f["id"]})
+    subs = {p: await sub(p) for p in ("/api/v1/", "/api/v1/spool", f"/api/v1/spool/{s1['id']}", "/api/v1/filament", "/api/v1/vendor")}
+    await asyncio.sleep(0.2)
+    await call("PATCH", f"/api/v1/spool/{s1['id']}", {"comment": "one"})
+    await call("PATCH", f"/api/v1/spool/{s2['id']}", {"comment": "two" * 60})   # > 125 bytes payload
+    await call("PATCH", f"/api/v1/filament/{f['id']}", {"comment": "f"})
+    await call("PATCH", f"/api/v1/vendor/{v['id']}", {"comment": "v"})
+    f2 = await call("POST", "/api/v1/filament", {"density": 1.0, "diameter": 1.75})
+    await call("DELETE", f"/api/v1/filament/{f2['id']}")
+    await asyncio.sleep(0.5)
+    out = {}
+    for p, (conn, got, task) in subs.items():
+        out[p] = [(e["resource"], e["type"], e["payload"]["id"]) for e in got]
+        conn.close()
+        task.cancel()
+    return out, s1["id"], s2["id"], f["id"], f2["id"], v["id"]
+
+
+def test_ws_subscriptions():
+    srv = Server()
+    try:
+        srv.start()
+        ev, s1, s2, f1, f2, v1 = asyncio.run(_ws_subscriptions(srv.base_url(), srv.port))
+        check("ws sub: /api/v1/spool gets spool events only (Moonraker)",
+              ev["/api/v1/spool"] == [("spool", "updated", s1), ("spool", "updated", s2)], ev["/api/v1/spool"])
+        check("ws sub: /api/v1/spool/{id} gets that spool only",
+              ev[f"/api/v1/spool/{s1}"] == [("spool", "updated", s1)], ev[f"/api/v1/spool/{s1}"])
+        check("ws sub: /api/v1/filament gets filament events (updated, added, deleted)",
+              ev["/api/v1/filament"] == [("filament", "updated", f1), ("filament", "added", f2), ("filament", "deleted", f2)],
+              ev["/api/v1/filament"])
+        check("ws sub: /api/v1/vendor gets vendor events", ev["/api/v1/vendor"] == [("vendor", "updated", v1)], ev["/api/v1/vendor"])
+        check("ws sub: /api/v1/ gets everything", len(ev["/api/v1/"]) == 6, ev["/api/v1/"])
+        for bad in ("/api/v1/info", "/api/v1/spool/abc", "/api/v1/spool/"):
+            s = socket.create_connection(("127.0.0.1", srv.port), timeout=3)
+            st, _ = ws_handshake(s, path=bad)
+            s.close()
+            check(f"ws sub: {bad} -> 404", st == 404, st)
+    finally:
+        srv.cleanup()
+
 
 def test_ui():
     srv = Server()
@@ -1411,6 +1546,8 @@ def main():
     finally:
         srv.cleanup()
 
+    test_api_gaps()
+    test_ws_subscriptions()
     test_ui()
     test_ui_disabled()
     test_ui_security_headers()

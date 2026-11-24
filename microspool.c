@@ -1132,6 +1132,22 @@ static cJSON *spool_response_json(const Spool *s) {
 /* ошибки (400/404/...), msg заполнен человекочитаемым текстом.            */
 /* ------------------------------------------------------------------------ */
 
+/* Spoolman list parameters we support: limit/offset (X-Total-Count stays the
+   number of matches before paging) and, for filaments, vendor.id. */
+#define MAX_ID_FILTER 16
+typedef struct {
+    long limit;                     /* -1 = no limit */
+    long offset;
+    int  n_vendor_ids;              /* 0 = no vendor filter */
+    int  vendor_ids[MAX_ID_FILTER]; /* -1 = "no vendor", as in Spoolman */
+} ListQuery;
+
+static void page_range(int n, const ListQuery *q, int *from, int *to) {
+    long f = q->offset < n ? q->offset : n;
+    long t = (q->limit < 0 || q->limit > n - f) ? n : f + q->limit;
+    *from = (int)f; *to = (int)t;
+}
+
 #define VENDOR_ACTIVE_COUNT(n) do { n = 0; for (int _i = 0; _i < MAX_VENDORS; _i++) if (g_vendors[_i].id) n++; } while (0)
 #define FILAMENT_ACTIVE_COUNT(n) do { n = 0; for (int _i = 0; _i < MAX_FILAMENTS; _i++) if (g_filaments[_i].id) n++; } while (0)
 #define SPOOL_ACTIVE_COUNT(n) do { n = 0; for (int _i = 0; _i < MAX_SPOOLS; _i++) if (g_spools[_i].id) n++; } while (0)
@@ -1196,12 +1212,13 @@ static int vendor_get(int id, cJSON **body_out, char *msg, size_t msgsz) {
     return 0;
 }
 
-static int vendor_list(cJSON **body_out, int *count) {
-    int ids[MAX_VENDORS], n = 0;
+static int vendor_list(const ListQuery *q, cJSON **body_out, int *count) {
+    int ids[MAX_VENDORS], n = 0, from, to;
     for (int i = 0; i < MAX_VENDORS; i++) if (g_vendors[i].id) ids[n++] = g_vendors[i].id;
     qsort(ids, n, sizeof(int), cmp_int);
     cJSON *arr = cJSON_CreateArray();
-    for (int i = 0; i < n; i++) cJSON_AddItemToArray(arr, vendor_json(vendor_find(ids[i])));
+    page_range(n, q, &from, &to);
+    for (int i = from; i < to; i++) cJSON_AddItemToArray(arr, vendor_json(vendor_find(ids[i])));
     *body_out = arr;
     *count = n;
     return 0;
@@ -1373,12 +1390,23 @@ static int filament_get(int id, cJSON **body_out, char *msg, size_t msgsz) {
     return 0;
 }
 
-static int filament_list(cJSON **body_out, int *count) {
-    int ids[MAX_FILAMENTS], n = 0;
-    for (int i = 0; i < MAX_FILAMENTS; i++) if (g_filaments[i].id) ids[n++] = g_filaments[i].id;
+static int filament_matches(const Filament *f, const ListQuery *q) {
+    if (q->n_vendor_ids == 0) return 1;
+    for (int k = 0; k < q->n_vendor_ids; k++) {
+        if (q->vendor_ids[k] == -1 && !f->has_vendor_id) return 1;
+        if (f->has_vendor_id && f->vendor_id == q->vendor_ids[k]) return 1;
+    }
+    return 0;
+}
+
+static int filament_list(const ListQuery *q, cJSON **body_out, int *count) {
+    int ids[MAX_FILAMENTS], n = 0, from, to;
+    for (int i = 0; i < MAX_FILAMENTS; i++)
+        if (g_filaments[i].id && filament_matches(&g_filaments[i], q)) ids[n++] = g_filaments[i].id;
     qsort(ids, n, sizeof(int), cmp_int);
     cJSON *arr = cJSON_CreateArray();
-    for (int i = 0; i < n; i++) cJSON_AddItemToArray(arr, filament_response_json(filament_find(ids[i])));
+    page_range(n, q, &from, &to);
+    for (int i = from; i < to; i++) cJSON_AddItemToArray(arr, filament_response_json(filament_find(ids[i])));
     *body_out = arr;
     *count = n;
     return 0;
@@ -1538,8 +1566,8 @@ static int spool_get(int id, cJSON **body_out, char *msg, size_t msgsz) {
     return 0;
 }
 
-static int spool_list(int allow_archived, cJSON **body_out, int *count) {
-    int ids[MAX_SPOOLS], n = 0;
+static int spool_list(int allow_archived, const ListQuery *q, cJSON **body_out, int *count) {
+    int ids[MAX_SPOOLS], n = 0, from, to;
     for (int i = 0; i < MAX_SPOOLS; i++) {
         if (!g_spools[i].id) continue;
         if (g_spools[i].archived && !allow_archived) continue;
@@ -1547,7 +1575,8 @@ static int spool_list(int allow_archived, cJSON **body_out, int *count) {
     }
     qsort(ids, n, sizeof(int), cmp_int);
     cJSON *arr = cJSON_CreateArray();
-    for (int i = 0; i < n; i++) cJSON_AddItemToArray(arr, spool_response_json(spool_find(ids[i])));
+    page_range(n, q, &from, &to);
+    for (int i = from; i < to; i++) cJSON_AddItemToArray(arr, spool_response_json(spool_find(ids[i])));
     *body_out = arr;
     *count = n;
     return 0;
@@ -1745,6 +1774,60 @@ static void split_path(const char *raw, char *out_path, size_t out_sz) {
     out_path[len] = 0;
 }
 
+/* Raw value of `key` in the query string (no percent-decoding; only used for
+   numbers). Returns 1 if present. */
+static int query_param(const char *raw, const char *key, char *out, size_t outsz) {
+    const char *q = strchr(raw, '?');
+    if (!q) return 0;
+    size_t klen = strlen(key);
+    for (q++; *q; ) {
+        size_t seglen = strcspn(q, "&");
+        if (seglen > klen && q[klen] == '=' && strncmp(q, key, klen) == 0) {
+            size_t vlen = seglen - klen - 1;
+            if (vlen >= outsz) vlen = outsz - 1;
+            memcpy(out, q + klen + 1, vlen);
+            out[vlen] = 0;
+            return 1;
+        }
+        q += seglen;
+        if (*q == '&') q++;
+    }
+    return 0;
+}
+
+static int parse_long_param(const char *v, long min, long max, long *out) {
+    char *end;
+    errno = 0;
+    long x = strtol(v, &end, 10);
+    if (!*v || *end || errno || x < min || x > max) return -1;
+    *out = x;
+    return 0;
+}
+
+/* limit, offset and vendor.id (vendor_id is the older Spoolman name). 0 = ok. */
+static int parse_list_query(const char *raw, ListQuery *q, char *msg, size_t msgsz) {
+    memset(q, 0, sizeof *q);
+    q->limit = -1;
+    char v[128];
+    if (query_param(raw, "limit", v, sizeof v) && parse_long_param(v, 0, INT_MAX, &q->limit) != 0) {
+        snprintf(msg, msgsz, "limit must be a non-negative integer"); return -1;
+    }
+    if (query_param(raw, "offset", v, sizeof v) && parse_long_param(v, 0, INT_MAX, &q->offset) != 0) {
+        snprintf(msg, msgsz, "offset must be a non-negative integer"); return -1;
+    }
+    if (query_param(raw, "vendor.id", v, sizeof v) || query_param(raw, "vendor_id", v, sizeof v)) {
+        char *save = NULL;
+        for (char *tok = strtok_r(v, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+            long id;
+            if (q->n_vendor_ids >= MAX_ID_FILTER || parse_long_param(tok, -1, INT_MAX, &id) != 0) {
+                snprintf(msg, msgsz, "vendor.id must be a comma-separated list of ids"); return -1;
+            }
+            q->vendor_ids[q->n_vendor_ids++] = (int)id;
+        }
+    }
+    return 0;
+}
+
 static int query_allow_archived(const char *raw_path_with_query) {
     const char *q = strchr(raw_path_with_query, '?');
     if (!q) return 0;
@@ -1794,6 +1877,8 @@ typedef struct {
     int rd_eof;               /* peer shut down its sending side; stop polling POLLIN */
 
     int is_ws;
+    char ws_resource[12];     /* subscribed resource ("" = all, else vendor/filament/spool) */
+    int ws_id;                /* subscribed record id, 0 = all records of the resource */
     double last_ping_sent_mono;
     double last_rx_mono;      /* last byte from a websocket peer (pong, ping, anything) */
     int ws_state; /* 0=заголовок кадра, 1=payload управляющего кадра, 2=съедаем данные */
@@ -2093,6 +2178,8 @@ static void ws_feed(Conn *c, const unsigned char *data, size_t n) {
 }
 
 static void ws_broadcast_event(const char *type, const char *resource, cJSON *payload_owned) {
+    const cJSON *pid = cJSON_GetObjectItemCaseSensitive(payload_owned, "id");
+    int id = cJSON_IsNumber(pid) ? pid->valueint : 0;
     cJSON *evt = cJSON_CreateObject();
     cJSON_AddStringToObject(evt, "type", type);
     cJSON_AddStringToObject(evt, "resource", resource);
@@ -2104,7 +2191,11 @@ static void ws_broadcast_event(const char *type, const char *resource, cJSON *pa
     if (!text) return;
     size_t len = strlen(text);
     for (int i = 0; i < MAX_CONNS; i++) {
-        if (g_conns[i].in_use && g_conns[i].is_ws && !g_conns[i].close_after_flush) {
+        Conn *w = &g_conns[i];
+        if (!w->in_use || !w->is_ws || w->close_after_flush) continue;
+        if (w->ws_resource[0] && strcmp(w->ws_resource, resource) != 0) continue;   /* other resource */
+        if (w->ws_id && w->ws_id != id) continue;                                     /* other record */
+        {
             ws_send_frame(&g_conns[i], 0x1, (const unsigned char *)text, len);
             conn_try_flush(&g_conns[i]);
         }
@@ -2151,6 +2242,58 @@ static void finish_write(Conn *c, int rc, cJSON *out, const char *msg, const cha
 /* Маршрутизация HTTP-запросов                                              */
 /* ------------------------------------------------------------------------ */
 
+/* /api/v1/field/{entity}[/{key}]: Spoolman's custom extra-field definitions.
+   microspool keeps no definitions: GET lists none, and a POST that defines one
+   is answered like Spoolman does (the entity's field list, here just the new
+   field) without storing it. Values still live in each record's extra, which is
+   all clients need: HelixScreen defines a field once and then PATCHes extra. */
+static void route_field(Conn *c, const HttpRequestMeta *m, const char *rest, const char *body, size_t body_len) {
+    char entity[16], key[65];
+    const char *slash = strchr(rest, '/');
+    size_t elen = slash ? (size_t)(slash - rest) : strlen(rest);
+    if (elen == 0 || elen >= sizeof entity) { http_send_error(c, 404, "not found"); return; }
+    memcpy(entity, rest, elen); entity[elen] = 0;
+    if (strcmp(entity, "vendor") != 0 && strcmp(entity, "filament") != 0 && strcmp(entity, "spool") != 0) {
+        http_send_error(c, 404, "unknown entity type"); return;
+    }
+    if (!slash) {
+        if (strcmp(m->method, "GET") != 0) { http_send_error(c, 405, "method not allowed"); return; }
+        http_send_json(c, 200, cJSON_CreateArray(), -1);
+        return;
+    }
+    const char *k = slash + 1;
+    size_t klen = strlen(k);
+    if (klen == 0 || klen >= sizeof key) { http_send_error(c, 400, "invalid field key"); return; }
+    for (size_t i = 0; i < klen; i++) {
+        if (!(islower((unsigned char)k[i]) || isdigit((unsigned char)k[i]) || k[i] == '_')) {
+            http_send_error(c, 400, "field key may contain only a-z, 0-9 and _"); return;
+        }
+    }
+    memcpy(key, k, klen + 1);
+    if (strcmp(m->method, "DELETE") == 0) { http_send_json(c, 200, cJSON_CreateArray(), -1); return; }
+    if (strcmp(m->method, "POST") != 0) { http_send_error(c, 405, "method not allowed"); return; }
+    cJSON *in = (body_len && utf8_valid((const unsigned char *)body, body_len)) ? cJSON_ParseWithLength(body, body_len) : NULL;
+    const cJSON *name = cJSON_GetObjectItemCaseSensitive(in, "name");
+    const cJSON *type = cJSON_GetObjectItemCaseSensitive(in, "field_type");
+    if (!cJSON_IsObject(in) || !cJSON_IsString(name) || !cJSON_IsString(type) ||
+        strlen(name->valuestring) > 256 || strlen(type->valuestring) > 32) {
+        cJSON_Delete(in);
+        http_send_error(c, 400, "name and field_type (strings) are required");
+        return;
+    }
+    cJSON *f = cJSON_CreateObject();
+    cJSON_AddStringToObject(f, "name", name->valuestring);
+    cJSON_AddNumberToObject(f, "order", 0);
+    cJSON_AddStringToObject(f, "field_type", type->valuestring);
+    cJSON_AddStringToObject(f, "key", key);
+    cJSON_AddStringToObject(f, "entity_type", entity);
+    cJSON_AddBoolToObject(f, "multi_choice", 0);
+    cJSON_Delete(in);
+    cJSON *arr = cJSON_CreateArray();
+    cJSON_AddItemToArray(arr, f);
+    http_send_json(c, 200, arr, -1);
+}
+
 static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, size_t body_len) {
     char path[1024];
     split_path(m->path, path, sizeof path);
@@ -2163,13 +2306,10 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         cJSON_AddStringToObject(o, "microspool_version", MICROSPOOL_VERSION);
         cJSON_AddBoolToObject(o, "debug_mode", 0);
         cJSON_AddBoolToObject(o, "automatic_backups", 0);
-        /* realpath() пишет до PATH_MAX (на Linux 4096, на macOS 1024) — буфер меньше PATH_MAX
-           означает затирание стека, поэтому просим glibc/musl выделить память сами (POSIX.1-2008). */
-        char *resolved = realpath(g_data_path, NULL);
-        char abspath[PATH_MAX];
-        snprintf(abspath, sizeof abspath, "%s", resolved ? resolved : g_data_path);
-        free(resolved);
-        cJSON_AddStringToObject(o, "data_dir", abspath);
+        /* Only the file name: the API is open to the LAN, and nobody (Moonraker,
+           Fluidd, Mainsail, HelixScreen) uses data_dir for anything. */
+        const char *slash = strrchr(g_data_path, '/');
+        cJSON_AddStringToObject(o, "data_dir", slash ? slash + 1 : g_data_path);
         cJSON_AddStringToObject(o, "backups_dir", "");
         cJSON_AddStringToObject(o, "db_type", "microspool");
         cJSON_AddNullToObject(o, "git_commit");
@@ -2184,9 +2324,15 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         http_send_json(c, 200, o, -1);
         return;
     }
-    if (strcmp(path, "/api/v1/external/vendor") == 0 || strcmp(path, "/api/v1/external/filament") == 0) {
+    /* No external catalog (SpoolmanDB) on the printer: every lookup is empty,
+       including /api/v1/external/filament/search that HelixScreen calls. */
+    if (strncmp(path, "/api/v1/external/", 17) == 0) {
         if (strcmp(m->method, "GET") != 0) { http_send_error(c, 405, "method not allowed"); return; }
         http_send_json(c, 200, cJSON_CreateArray(), 0);
+        return;
+    }
+    if (strncmp(path, "/api/v1/field/", 14) == 0) {
+        route_field(c, m, path + 14, body, body_len);
         return;
     }
     if (strcmp(path, "/api/v1/setting/currency") == 0) {
@@ -2295,13 +2441,15 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
 
     if (strcmp(path, "/api/v1/vendor") == 0) {
         if (strcmp(m->method, "GET") == 0) {
-            cJSON *arr; int cnt; vendor_list(&arr, &cnt);
+            ListQuery lq; char msg[300];
+            if (parse_list_query(m->path, &lq, msg, sizeof msg) != 0) { http_send_error(c, 400, msg); goto done; }
+            cJSON *arr; int cnt; vendor_list(&lq, &arr, &cnt);
             http_send_json(c, 200, arr, cnt);
         } else if (strcmp(m->method, "POST") == 0) {
             cJSON *out = NULL; char msg[300];
             undo_begin();
             int rc = vendor_create(input, &out, msg, sizeof msg);
-            finish_write(c, rc, out, msg, NULL, "vendor");
+            finish_write(c, rc, out, msg, "added", "vendor");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -2321,11 +2469,11 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         } else if (strcmp(m->method, "PATCH") == 0) {
             undo_begin();
             rc = vendor_patch(id, input, &out, msg, sizeof msg);
-            finish_write(c, rc, out, msg, NULL, "vendor");
+            finish_write(c, rc, out, msg, "updated", "vendor");
         } else if (strcmp(m->method, "DELETE") == 0) {
             undo_begin();
             rc = vendor_delete(id, &out, msg, sizeof msg);
-            finish_write(c, rc, out, msg, NULL, "vendor");
+            finish_write(c, rc, out, msg, "deleted", "vendor");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -2334,13 +2482,15 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
 
     if (strcmp(path, "/api/v1/filament") == 0) {
         if (strcmp(m->method, "GET") == 0) {
-            cJSON *arr; int cnt; filament_list(&arr, &cnt);
+            ListQuery lq; char msg[300];
+            if (parse_list_query(m->path, &lq, msg, sizeof msg) != 0) { http_send_error(c, 400, msg); goto done; }
+            cJSON *arr; int cnt; filament_list(&lq, &arr, &cnt);
             http_send_json(c, 200, arr, cnt);
         } else if (strcmp(m->method, "POST") == 0) {
             cJSON *out = NULL; char msg[300];
             undo_begin();
             int rc = filament_create(input, &out, msg, sizeof msg);
-            finish_write(c, rc, out, msg, NULL, "filament");
+            finish_write(c, rc, out, msg, "added", "filament");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -2360,11 +2510,11 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
         } else if (strcmp(m->method, "PATCH") == 0) {
             undo_begin();
             rc = filament_patch(id, input, &out, msg, sizeof msg);
-            finish_write(c, rc, out, msg, NULL, "filament");
+            finish_write(c, rc, out, msg, "updated", "filament");
         } else if (strcmp(m->method, "DELETE") == 0) {
             undo_begin();
             rc = filament_delete(id, &out, msg, sizeof msg);
-            finish_write(c, rc, out, msg, NULL, "filament");
+            finish_write(c, rc, out, msg, "deleted", "filament");
         } else {
             http_send_error(c, 405, "method not allowed");
         }
@@ -2374,7 +2524,9 @@ static void route_and_dispatch(Conn *c, HttpRequestMeta *m, const char *body, si
     if (strcmp(path, "/api/v1/spool") == 0) {
         if (strcmp(m->method, "GET") == 0) {
             int allow_archived = query_allow_archived(m->path);
-            cJSON *arr; int cnt; spool_list(allow_archived, &arr, &cnt);
+            ListQuery lq; char msg[300];
+            if (parse_list_query(m->path, &lq, msg, sizeof msg) != 0) { http_send_error(c, 400, msg); goto done; }
+            cJSON *arr; int cnt; spool_list(allow_archived, &lq, &arr, &cnt);
             http_send_json(c, 200, arr, cnt);
         } else if (strcmp(m->method, "POST") == 0) {
             cJSON *out = NULL; char msg[300];
@@ -2650,6 +2802,28 @@ static void process_http_buffer(Conn *c) {
                 conn_try_flush(c);
                 return;
             }
+            /* Spoolman's websocket paths: /api/v1/ (everything), /api/v1/<resource>
+               and /api/v1/<resource>/<id>. Moonraker uses /api/v1/spool. */
+            const char *sub = path_only + 7;   /* after "/api/v1" */
+            char res[12] = "";
+            long sub_id = 0;
+            if (*sub == '/') sub++;
+            if (*sub) {
+                size_t rl = strcspn(sub, "/");
+                if (rl < sizeof res) { memcpy(res, sub, rl); res[rl] = 0; }
+                char *endp = NULL;
+                if (sub[rl] == '/') sub_id = strtol(sub + rl + 1, &endp, 10);
+                int bad_res = strcmp(res, "vendor") != 0 && strcmp(res, "filament") != 0 && strcmp(res, "spool") != 0;
+                int bad_id = sub[rl] == '/' && (!sub[rl + 1] || *endp || sub_id <= 0 || sub_id >= INT_MAX);
+                if (bad_res || bad_id) {
+                    http_send_error(c, 404, "no websocket at this path");
+                    c->state = CS_HTTP_CLOSING;
+                    conn_try_flush(c);
+                    return;
+                }
+            }
+            memcpy(c->ws_resource, res, sizeof res);
+            c->ws_id = (int)sub_id;
             if (!c->is_local && remote_ws >= MAX_REMOTE_WS) {
                 http_send_error(c, 503, "too many websocket clients");
                 c->state = CS_HTTP_CLOSING;
