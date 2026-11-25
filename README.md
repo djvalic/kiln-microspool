@@ -74,6 +74,7 @@ In your `moonraker.conf`, a `[microspool]` section of your own changes these
 | `port` | `7912` | |
 | `data_file` | `/home/klipper/printer_data/microspool/microspool.json` | |
 | `binary` | the plugin's `bin/microspool` | |
+| `allow_hosts` | | more names you open the web page by, comma separated, e.g. `ad5x.home, ad5x.your-tailnet.ts.net` |
 | `extra_args` | | more microspool options |
 
 `GET /server/microspool/status` shows whether it runs, its restarts and
@@ -89,7 +90,10 @@ Like Fluidd on Kiln OS, the web page has no login: anyone on your network
 can change the inventory (nothing else; it can't reach files or run
 anything). Kiln's fork limits connections, sizes and time per client, and
 refuses requests from other web sites, so a device or a web page on the
-network can't lock Moonraker out of it. Use `host: 127.0.0.1` if your
+network can't lock Moonraker out of it. The page answers to the printer's
+IP address, `localhost` and its own hostname (`ad5x`, `ad5x.local`); for any
+other name (your router's `ad5x.home`, a Tailscale name) add it to
+`allow_hosts`, or the page says "host not allowed". Use `host: 127.0.0.1` if your
 network isn't trusted.
 
 ## How it runs

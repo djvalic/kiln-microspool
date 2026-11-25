@@ -2613,7 +2613,9 @@ done:
 /*  - Origin: websocket upgrades and every method other than GET/HEAD must  */
 /*    come without an Origin header (non-browser clients such as Moonraker) */
 /*    or from the same origin as the Host they were sent to, or from an     */
-/*    origin given with -o.                                                 */
+/*    origin given with -o. A websocket upgrade may also come from another  */
+/*    port on the Host's own name (Fluidd's page on port 80); the socket    */
+/*    is read-only (change notices).                                        */
 /*  - Content-Type: a POST/PATCH/PUT with a body must say application/json; */
 /*    a cross-site form or text/plain POST is refused before parsing.       */
 /* ------------------------------------------------------------------------ */
@@ -2682,7 +2684,10 @@ static int origin_authority(const char *scheme, const char *hostport, char *out,
     return (n < 0 || (size_t)n >= outsz) ? -1 : 0;
 }
 
-static int origin_allowed(const HttpRequestMeta *m) {
+/* same_host_any_port: also accept an origin on the Host's own name with
+   another port (websocket upgrades only: Fluidd on port 80 opens the live
+   update socket on 7912 itself; the socket only sends change notices). */
+static int origin_allowed(const HttpRequestMeta *m, int same_host_any_port) {
     if (!m->has_origin) return 1;
     char want[300];
     snprintf(want, sizeof want, "%s", m->origin);
@@ -2700,7 +2705,12 @@ static int origin_allowed(const HttpRequestMeta *m) {
     char a[300], b[300];
     if (origin_authority(scheme, sep + 3, a, sizeof a) != 0) return 0;
     if (origin_authority(scheme, m->host, b, sizeof b) != 0) return 0;
-    return strcmp(a, b) == 0;
+    if (strcmp(a, b) == 0) return 1;
+    if (!same_host_any_port) return 0;
+    char na[256], nb[256];
+    if (host_name_part(sep + 3, na, sizeof na) != 0) return 0;
+    if (host_name_part(m->host, nb, sizeof nb) != 0) return 0;
+    return strcmp(na, nb) == 0;
 }
 
 static int content_type_is_json(const char *ct) {
@@ -2720,7 +2730,7 @@ static int request_rejected(Conn *c, const HttpRequestMeta *m) {
         return 403;
     }
     int safe_method = str_ieq(m->method, "GET") || str_ieq(m->method, "HEAD");
-    if ((m->is_ws_upgrade || !safe_method) && !origin_allowed(m)) {
+    if ((m->is_ws_upgrade || !safe_method) && !origin_allowed(m, m->is_ws_upgrade && safe_method)) {
         log_v("refused Origin: %s", m->origin);
         http_send_error(c, 403, "origin not allowed (start microspool with -o <origin> to allow it)");
         return 403;

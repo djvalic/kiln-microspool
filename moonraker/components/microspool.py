@@ -14,6 +14,10 @@
 #   port        7912 (Spoolman's port; Fluidd's "Manage spools" opens it)
 #   data_file   the spool inventory, one JSON file
 #   binary      the microspool program
+#   allow_hosts more names the web page may be opened by (comma or space
+#               separated, e.g. ad5x.home, ad5x.tailnet-name.ts.net); IP
+#               addresses, localhost and the printer's own hostname always
+#               work (microspool -H, its DNS rebinding check)
 #   extra_args  more command line options for microspool
 #
 # Endpoint: GET /server/microspool/status
@@ -31,6 +35,7 @@ import asyncio
 import ctypes
 import logging
 import os
+import re
 import shlex
 import signal
 import time
@@ -43,6 +48,10 @@ if TYPE_CHECKING:
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
 DEFAULT_DATA = "/home/klipper/printer_data/microspool/microspool.json"
+# allow_hosts: plain DNS names only (no wildcards, ports or addresses)
+HOST_NAME_RE = re.compile(
+    r"^(?=.{1,253}\.?$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$")
 # Restart back-off: 2 s, doubling to 5 min; reset after 10 min of running
 BACKOFF_MIN = 2.
 BACKOFF_MAX = 300.
@@ -68,6 +77,15 @@ class Microspool:
         self.data_file = config.get("data_file", default_data)
         self.binary = config.get(
             "binary", os.path.join(PLUGIN_DIR, "bin", "microspool"))
+        self.allow_hosts: List[str] = []
+        self.bad_hosts: List[str] = []
+        for name in re.split(r"[\s,]+", config.get("allow_hosts", "")):
+            if not name:
+                continue
+            if HOST_NAME_RE.match(name):
+                self.allow_hosts.append(name.lower().rstrip("."))
+            else:
+                self.bad_hosts.append(name)
         self.extra_args = shlex.split(config.get("extra_args", ""))
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.task: Optional[asyncio.Task] = None
@@ -83,11 +101,19 @@ class Microspool:
             "server:klippy_ready", self._on_klippy_ready)
 
     def _command(self) -> List[str]:
-        return [self.binary, "-l", self.host, "-p", str(self.port),
-                "-d", self.data_file] + self.extra_args
+        cmd = [self.binary, "-l", self.host, "-p", str(self.port),
+               "-d", self.data_file]
+        for name in self.allow_hosts:
+            cmd += ["-H", name]
+        return cmd + self.extra_args
 
     async def component_init(self) -> None:
         self._check_own_spoolman()
+        if self.bad_hosts:
+            self.server.add_warning(
+                "kiln-microspool: allow_hosts takes host names such as "
+                "ad5x.home; left out: %s" % (", ".join(self.bad_hosts),),
+                warn_id="microspool_allow_hosts")
         self.task = asyncio.create_task(self._supervise())
 
     def _check_own_spoolman(self) -> None:

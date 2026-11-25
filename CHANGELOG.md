@@ -1,5 +1,15 @@
 # Changelog
 
+## kiln-microspool 0.1.2 (Kiln OS plugin)
+
+- New setting `allow_hosts` in `[microspool]`: more names the web page may be opened by, such as
+  `ad5x.home` or a Tailscale name (passed to microspool as `-H`). IP addresses, `localhost` and the
+  printer's own hostname work as before; wildcards, ports and addresses are left out with a warning.
+- Fluidd's Spoolman card no longer says "Spoolman is blocking Fluidd's browser origin": Fluidd's page
+  (port 80) opens the live-update websocket on microspool's port itself, and microspool now accepts
+  a websocket from another port on its own host name. The websocket only sends change notices;
+  writes still need the page's exact origin (or `-o`), and pages from other hosts are still refused.
+
 ## kiln-microspool 0.1.1 (Kiln OS plugin)
 
 - On a printer with the IFS, Fluidd shows a reminder to also install Spoolman (kiln-spoolman) as

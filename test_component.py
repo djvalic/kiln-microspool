@@ -141,6 +141,38 @@ def main():
     check("microspool on another port -> warning",
           "microspool_own_spoolman" in w)
 
+    # allow_hosts -> one -H per name; bad names left out with a warning
+    with tempfile.TemporaryDirectory() as d:
+        srv = Server(d)
+        comp = ms.load_component(Config(srv, {"port": 7912}))
+        cmd = comp._command()
+        check("no allow_hosts -> no -H", "-H" not in cmd)
+        srv = Server(d)
+        comp = ms.load_component(Config(srv, {
+            "port": 7912, "allow_hosts":
+            "ad5x.home, AD5X.tail-net.ts.net.\n  printer-2 *  1.2.3.4:80 a/b",
+            "extra_args": "-v"}))
+        cmd = comp._command()
+        hs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-H"]
+        check("allow_hosts names -> -H each, lower case, no trailing dot",
+              hs == ["ad5x.home", "ad5x.tail-net.ts.net", "printer-2"])
+        check("extra_args still last", cmd[-1] == "-v")
+        check("wildcard, port and slash refused",
+              comp.bad_hosts == ["*", "1.2.3.4:80", "a/b"])
+
+        async def init_warns():
+            comp.task = None
+            orig = comp._supervise
+            async def nothing():
+                return None
+            comp._supervise = nothing
+            await comp.component_init()
+            await comp.task
+            comp._supervise = orig
+        asyncio.run(init_warns())
+        check("bad names -> warning naming them",
+              "*" in srv.warnings.get("microspool_allow_hosts", ""))
+
     print("\n%d passed, %d failed" % (PASSES, len(FAILS)))
     return 1 if FAILS else 0
 

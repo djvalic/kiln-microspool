@@ -56,7 +56,9 @@ There is still no login, but hostile LAN clients and web pages are kept in check
 - The `Host` header must be an IP address, `localhost`, the machine's hostname or `<hostname>.local`
   (DNS rebinding). Allow other names with `-H name` (repeatable, `-H '*'` allows any).
 - Writes and websockets from a browser must come from the same origin as the page; allow another origin
-  with `-o http://name[:port]`. Clients without an `Origin` header (Moonraker, curl) are not affected.
+  with `-o http://name[:port]`. A websocket (read-only change notices) may also come from another port
+  on the same host name, as Fluidd's page on port 80 does. Clients without an `Origin` header
+  (Moonraker, curl) are not affected.
 - Request bodies must be `Content-Type: application/json`, valid UTF-8, finite numbers.
 - LAN clients can save at most about once per second after a burst of 5 writes.
 

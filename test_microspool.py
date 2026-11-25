@@ -651,6 +651,12 @@ def test_host_origin_content_type():
         check("ws origin: no Origin (Moonraker/tornado) -> 101", ws_status({}) == 101)
         check("ws origin: same origin -> 101", ws_status({"Origin": f"http://127.0.0.1:{port}"}) == 101)
         check("ws origin: foreign page -> 403", ws_status({"Origin": "http://evil.example"}) == 403)
+        check("ws origin: Fluidd on the same host, port 80 -> 101",
+              ws_status({"Origin": "http://192.0.2.56"}, host=f"192.0.2.56:{port}") == 101)
+        check("ws origin: other host on port 80 -> 403",
+              ws_status({"Origin": "http://192.0.2.57"}, host=f"192.0.2.56:{port}") == 403)
+        check("origin: Fluidd's port 80 page still can't POST directly -> 403",
+              st(f"192.0.2.56:{port}", "POST", "/api/v1/vendor", {**jh, "Origin": "http://192.0.2.56"}, vend) == 403)
         check("ws host: foreign Host -> 403", ws_status({}, host="evil.example") == 403)
 
         status, before, _ = http_json(srv.base_url(), "GET", "/api/v1/vendor")
